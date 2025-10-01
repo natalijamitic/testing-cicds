@@ -4,6 +4,10 @@ on:
     push:
         branches:
             - main
+        paths:
+            - '**/*.py'
+            - 'requirements.txt'
+            - '.github/workflows/**'
     pull_request:
         branches:
             - main
