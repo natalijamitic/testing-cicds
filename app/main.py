@@ -77,7 +77,7 @@ async def predict(
     ]
 
     if model_name not in ml_models.keys():
-        raise HTTPException(status_code=404, detail="Model not found.")
+        raise HTTPException(status_code=422, detail="Model not found.")
 
     model = ml_models[model_name]
     prediction = model.predict(input_data)
