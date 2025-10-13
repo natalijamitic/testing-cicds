@@ -73,8 +73,8 @@ runs:
           }
 
           const tenants = [...set].sort();
+          core.info(`bump=${bump}, tenants=[${tenants.join(', ')}]`);
           core.setOutput('skip', 'false');
           core.setOutput('bump', bump);
           core.setOutput('tenants', tenants.join(','));
-          core.info(`bump=${bump}, tenants=[${tenants.join(', ')}], skip=${skip}`);
 
