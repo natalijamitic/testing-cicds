@@ -1,4 +1,4 @@
-name: Auto tag & release on merge to development
+name: Auto tag and release on merge to development
 
 on:
   pull_request:
