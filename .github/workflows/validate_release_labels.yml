@@ -23,13 +23,6 @@ jobs:
         uses: ./.github/actions/validate-release-labels
         with:
           enforce: "true"
-      
-      - name: Debug outputs
-        id: debug
-        run: |
-          echo ${{ steps.validate.outputs.skip }}
-          echo ${{ steps.validate.outputs.bump }}
-          echo ${{ steps.validate.outputs.tenants }}
 
       # Optional: echo what we resolved (for visibility when valid)
       - name: Summary
