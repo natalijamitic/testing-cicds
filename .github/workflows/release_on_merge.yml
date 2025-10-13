@@ -5,7 +5,7 @@ on:
     types: [closed]
 
 permissions:
-  contents: write  # needed to create tags & releases
+  contents: write     # create tags & releases
   pull-requests: read
 
 concurrency:
@@ -20,55 +20,56 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Derive labels (bump + tenant)
+      # 1) Parse labels via shared composite (no failing; just skip if invalid/none)
+      - name: Derive labels (bump + tenants)
         id: labels
-        uses: actions/github-script@v7
+        uses: ./.github/actions/validate-release-labels
         with:
-          script: |
-            const pr = context.payload.pull_request;
-            const labels = (pr.labels || []).map(l => l.name);
-            const bump = labels.find(l => l.startsWith('release:')) || '';
-            const tenant = labels.find(l => l.startsWith('tenant:')) || '';
-            if (!bump || !tenant) core.setFailed(`Missing bump or tenant labels. Got: ${labels.join(', ')}`);
-            core.setOutput('bump', bump.replace('release:', ''));   // patch|minor|major|none
-            core.setOutput('tenant', tenant.replace('tenant:', '')); // default|csu|both
-            core.setOutput('merge_sha', pr.merge_commit_sha);
+          enforce: "false"
 
-      - name: Stop if release:none
-        if: steps.labels.outputs.bump == 'none'
-        run: echo "Release bump is 'none' — skipping tag creation."
+      - name: Stop if skip
+        if: steps.labels.outputs.skip == 'true'
+        run: echo "Skipping release — no valid labels or release:none."
 
-      - name: Checkout (fetch all tags)
-        if: steps.labels.outputs.bump != 'none'
+      # 2) Checkout + tags
+      - name: Checkout (full history)
+        if: steps.labels.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
-            fetch-depth: 0
+          fetch-depth: 0
 
       - name: Fetch tags
-        if: steps.labels.outputs.bump != 'none'
+        if: steps.labels.outputs.skip != 'true'
         run: git fetch --tags --force --quiet
 
+      # 3) Compute next SemVer (global across tenants)
       - name: Compute next version
-        if: steps.labels.outputs.bump != 'none'
+        if: steps.labels.outputs.skip != 'true'
         id: semver
         shell: bash
         run: |
           set -euo pipefail
+
           BUMP="${{ steps.labels.outputs.bump }}"
 
-          # Find latest X.Y.Z across all release/dev/*/* tags
-          LATEST=$(git tag -l 'release/dev/*/*' | awk -F'/' '{print $4}' | sort -V | tail -n1)
+          # Find latest X.Y.Z across all release/dev/*/* tags (4th path part)
+          LATEST=$(
+            git for-each-ref 'refs/tags/release/dev/*/*' --format='%(refname:short)' \
+            | awk -F'/' '{print $4}' \
+            | sort -V \
+            | tail -n1
+          )
           if [[ -z "${LATEST}" ]]; then
             LATEST="0.0.0"
           fi
 
           IFS='.' read -r MA MI PA <<< "${LATEST}"
 
-          case "${BUMP}" in
+          case "$BUMP" in
             patch)  PA=$((PA+1)) ;;
             minor)  MI=$((MI+1)); PA=0 ;;
             major)  MA=$((MA+1)); MI=0; PA=0 ;;
-            *) echo "Unknown bump: ${BUMP}"; exit 1 ;;
+            *) echo "Unknown bump: $BUMP"; exit 1 ;;
           esac
 
           NEXT="${MA}.${MI}.${PA}"
@@ -76,28 +77,26 @@ jobs:
           echo "NEXT=${NEXT}"
           echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
 
+      # 4) Create tenant tags at the merge commit
       - name: Create tags for target tenant(s)
-        if: steps.labels.outputs.bump != 'none'
+        if: steps.labels.outputs.skip != 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const next = core.getInput('next', { required: false }) || '${{ steps.semver.outputs.next }}';
-            const tenant = '${{ steps.labels.outputs.tenant }}';
-            const mergeSha = '${{ steps.labels.outputs.merge_sha }}';
+            const next     = '${{ steps.semver.outputs.next }}';
+            const mergeSha = context.payload.pull_request.merge_commit_sha;
+            const tenants  = '${{ steps.labels.outputs.tenants }}'.split(',').filter(Boolean);
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
-            const tagNames = [];
-            if (tenant === 'default' || tenant === 'both') tagNames.push(`release/dev/default/${next}`);
-            if (tenant === 'csu'     || tenant === 'both') tagNames.push(`release/dev/csu/${next}`);
+            const tagNames = tenants.map(t => `release/dev/${t}/${next}`);
+            core.info(`Creating up to ${tagNames.length} tag(s): ${tagNames.join(', ')}`);
 
-            async function ensureTag(tag) {
+            for (const tag of tagNames) {
               try {
-                // Check if ref exists
                 await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
-                core.info(`Tag already exists: ${tag} — skipping`);
+                core.info(`Tag exists: ${tag} — skipping`);
               } catch (e) {
-                // Create it if 404
                 if (e.status === 404) {
                   core.info(`Creating tag ${tag} at ${mergeSha}`);
                   await github.rest.git.createRef({
@@ -111,29 +110,32 @@ jobs:
               }
             }
 
-            for (const tag of tagNames) {
-              await ensureTag(tag);
-            }
-
-      - name: (Optional) Create GitHub Release (auto notes)
-        if: steps.labels.outputs.bump != 'none'
+      # 5) Create ONE canonical GitHub Release
+      - name: Create canonical GitHub Release
+        if: steps.labels.outputs.skip != 'true'
+        id: release
         uses: actions/github-script@v7
         with:
           script: |
-            const next = '${{ steps.semver.outputs.next }}';
-            // Single canonical release object (not tenant-specific),
-            // useful for changelogs; tag it with the default tag for discoverability.
-            const tagName = `release/dev/default/${next}`;
+            const next    = '${{ steps.semver.outputs.next }}';
+            const tenants = '${{ steps.labels.outputs.tenants }}'.split(',').filter(Boolean);
+
+            // Prefer "default"; otherwise pick the first tenant in the sorted set.
+            const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
+            const tagName = `release/dev/${canonicalTenant}/${next}`;
+
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
+            // Ensure the release exists (generate release notes from previous release)
+            let release;
             try {
-              await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
               core.info(`Release for ${tagName} already exists.`);
             } catch (e) {
               if (e.status === 404) {
-                core.info(`Creating release ${tagName}`);
-                await github.rest.repos.createRelease({
+                core.info(`Creating GitHub release for ${tagName}`);
+                release = await github.rest.repos.createRelease({
                   owner, repo,
                   tag_name: tagName,
                   name: `dev ${next}`,
@@ -145,3 +147,78 @@ jobs:
                 throw e;
               }
             }
+
+            core.setOutput('release_id', (release.data ? release.data.id : release.id));
+            core.setOutput('release_tag', tagName);
+
+      # 6) Append per-tenant delta sections to the same release body
+      - name: Append per-tenant delta to release body
+        if: steps.labels.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        with:
+            script: |
+                const next     = '${{ steps.semver.outputs.next }}';
+                const tenants  = '${{ steps.labels.outputs.tenants }}'.split(',').filter(Boolean);
+                const owner = context.repo.owner;
+                const repo  = context.repo.repo;
+
+                // Fetch the canonical release we created earlier
+                const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
+                const tagName = `release/dev/${canonicalTenant}/${next}`;
+                const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
+                let body = rel.data.body || '';
+
+                // Minimal semver comparator
+                function semverCmp(a, b) {
+                    const pa = a.split('.').map(Number);
+                    const pb = b.split('.').map(Number);
+                    for (let i = 0; i < 3; i++) {
+                    const da = pa[i] || 0, db = pb[i] || 0;
+                    if (da < db) return -1;
+                    if (da > db) return 1;
+                    }
+                    return 0;
+                }
+                const semverLess = (a, b) => semverCmp(a, b) < 0;
+
+                // For a tenant, fetch only refs under its prefix using Matching Refs API
+                async function findPrevTagForTenant(t) {
+                    const prefix = `tags/release/dev/${t}/`; // NOTE: Matching Refs needs 'tags/...'
+                    const { data: refs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: prefix });
+                    // refs[*].ref looks like 'refs/tags/release/dev/<tenant>/<version>'
+                    const versions = refs
+                    .map(r => r.ref.split('/').slice(-1)[0])     // grab the last path part (X.Y.Z)
+                    .filter(v => v && v !== next)
+                    .sort((a,b) => semverCmp(a,b));             // ascending semver
+                    // pick the greatest version strictly less than NEXT
+                    const prev = versions.filter(v => semverLess(v, next)).pop();
+                    return prev ? `release/dev/${t}/${prev}` : null;
+                }
+
+                for (const t of tenants) {
+                    const prevTag = await findPrevTagForTenant(t);
+                    const newTag  = `release/dev/${t}/${next}`;
+
+                    if (!prevTag) {
+                    body += `\n\n### ${t.toUpperCase()} changes\n_No previous tag found. Full history up to \`${newTag}\`._`;
+                    continue;
+                    }
+
+                    const compare = await github.rest.repos.compareCommitsWithBasehead({
+                    owner, repo, basehead: `${prevTag}...${newTag}`
+                    });
+
+                    const lines = (compare.data.commits || []).map(c => {
+                    const title = (c.commit?.message || '').split('\n')[0];
+                    const sha = (c.sha || '').slice(0,7);
+                    return `- ${title} (${sha})`;
+                    });
+
+                    body += `\n\n### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${next}**_\n` + (lines.length ? lines.join('\n') : '_No changes_');
+                }
+
+                await github.rest.repos.updateRelease({
+                    owner, repo,
+                    release_id: rel.data.id,
+                    body
+                });
