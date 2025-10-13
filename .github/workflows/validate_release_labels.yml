@@ -12,6 +12,11 @@ jobs:
   require-labels:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Validate labels (enforced)
         id: validate
         uses: ./.github/actions/validate-release-labels
