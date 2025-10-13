@@ -1,33 +1,26 @@
-name: Validate release labels
+name: PR Label Gate
 
 on:
   pull_request:
-    types: [opened, edited, labeled, unlabeled, synchronize, ready_for_review]
+    types: [opened, edited, labeled, unlabeled, synchronize, reopened, ready_for_review]
     branches: [development]
 
 permissions:
   pull-requests: read
-  statuses: write
 
 jobs:
-  check:
+  require-labels:
     runs-on: ubuntu-latest
     steps:
-      - name: Check required labels
-        uses: actions/github-script@v7
+      - name: Validate labels (enforced)
+        id: validate
+        uses: ./.github/actions/validate-release-labels
         with:
-          script: |
-            const pr = context.payload.pull_request;
-            if (pr.draft) {
-              core.notice('PR is draft; skipping validation.');
-              return;
-            }
-            const labels = (pr.labels || []).map(l => l.name);
-            const rel = labels.find(l => /^release:(patch|minor|major|none)$/.test(l));
-            const ten = labels.find(l => /^tenant:(default|csu|both)$/.test(l));
+          enforce: "true"
 
-            let ok = true;
-            if (!rel) { core.error('Missing release:* label (patch|minor|major|none)'); ok = false; }
-            if (!ten) { core.error('Missing tenant:* label (default|csu|both)'); ok = false; }
-
-            if (!ok) core.setFailed('Required labels not present.');
+      # Optional: echo what we resolved (for visibility when valid)
+      - name: Summary
+        if: success() && steps.validate.outputs.skip == 'false'
+        run: |
+          echo "Release bump: ${{ steps.validate.outputs.bump }}"
+          echo "Tenants: ${{ steps.validate.outputs.tenants }}"
