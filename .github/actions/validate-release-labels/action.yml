@@ -8,16 +8,25 @@ inputs:
 outputs:
   skip:
     description: "true if should skip tagging/deployment"
+    value: ${{ steps.validate.outputs.skip }}
   bump:
     description: "patch|minor|major|none"
+    value: ${{ steps.validate.outputs.bump }}
   tenants:
     description: "CSV of tenants (default,csu)"
+    value: ${{ steps.validate.outputs.tenants }}
 runs:
   using: "composite"
   steps:
-    - uses: actions/github-script@v7
+    - id: validate
+      uses: actions/github-script@v7
       with:
         script: |
+          // initialize outputs so they're never undefined
+          core.setOutput('skip', 'true');
+          core.setOutput('bump', 'none');
+          core.setOutput('tenants', '');
+
           const enforce = core.getInput('enforce') === 'true';
           const pr = context.payload.pull_request;
           const labels = (pr.labels || []).map(l => l.name);
