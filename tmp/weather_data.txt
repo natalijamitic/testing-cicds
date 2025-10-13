@@ -1,0 +1,1 @@
+Current temperature: 290.15 °K
