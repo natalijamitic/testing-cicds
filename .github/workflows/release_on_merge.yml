@@ -57,7 +57,7 @@ jobs:
           BUMP="${{ steps.labels.outputs.bump }}"
 
           # Find latest X.Y.Z across all release/dev/*/* tags
-          LATEST=$(git tag -l 'release/dev/*/*' | awk -F'/' '{print $5}' | sort -V | tail -n1)
+          LATEST=$(git tag -l 'release/dev/*/*' | awk -F'/' '{print $4}' | sort -V | tail -n1)
           if [[ -z "${LATEST}" ]]; then
             LATEST="0.0.0"
           fi
