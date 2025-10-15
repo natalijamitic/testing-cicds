@@ -1,13 +1,15 @@
 name: Validate release & tenant labels
-description: Parses PR labels (release:* + tenant:*) into bump/tenant info.
+description: Parses PR labels (release:* + tenant:*) into bump/tenants and decides skip.
+
 inputs:
   enforce:
-    description: "Fail if invalid labels (true = PR gate mode)"
+    description: "Fail if invalid labels (PR gate mode)"
     required: false
     default: "false"
+
 outputs:
   skip:
-    description: "true if should skip tagging/deployment"
+    description: "true if tagging/deploy should be skipped"
     value: ${{ steps.validate.outputs.skip }}
   bump:
     description: "patch|minor|major|none"
@@ -15,6 +17,12 @@ outputs:
   tenants:
     description: "CSV of tenants (default,csu)"
     value: ${{ steps.validate.outputs.tenants }}
+  invalid:
+    description: "true if labeling is invalid"
+    value: ${{ steps.validate.outputs.invalid }}
+  reason:
+    description: "human-readable reason for invalid labeling"
+    value: ${{ steps.validate.outputs.reason }}
 
 runs:
   using: "composite"
@@ -23,44 +31,64 @@ runs:
       uses: actions/github-script@v7
       with:
         script: |
-          // default outputs
+          // Always initialize outputs so they're never undefined
           core.setOutput('skip','true');
           core.setOutput('bump','none');
           core.setOutput('tenants','');
+          core.setOutput('invalid','false');
+          core.setOutput('reason','');
 
           const enforce = core.getInput('enforce') === 'true';
-          const pr = context.payload.pull_request;
-          const labels = (pr?.labels || []).map(l => l.name);
+          core.info(`validator: enforce=${enforce}`);
 
           const fail = (msg) => {
+            core.setOutput('invalid','true');
+            core.setOutput('reason', msg);
             if (enforce) {
               core.setFailed(msg);
-              throw new Error(msg);   // <-- ensure step (and job) fail
+              throw new Error(msg); // ensure step fails hard
             } else {
               core.info(msg);
             }
           };
 
-          // release labels
+          const pr = context.payload.pull_request;
+          if (!pr) {
+            return fail('No pull_request found in event payload.');
+          }
+
+          const labels = (pr.labels || []).map(l => l.name);
+
+          // ---- release:* labels
           const rel = labels.filter(l => l.startsWith('release:'));
-          if (rel.length === 0) return;  // skip allowed
-          if (rel.length !== 1) return fail(`Exactly one release:* required (patch|minor|major|none). Found: ${rel.join(', ')}`);
+          if (rel.length === 0) {
+            core.info('No release label -> skip deployment.');
+            return; // skip allowed
+          }
+          if (rel.length !== 1) {
+            return fail(`Exactly one release:* required (patch|minor|major|none). Found: ${rel.join(', ')}`);
+          }
 
           const bump = rel[0].replace('release:', '');
-          if (bump === 'none') return;   // skip allowed
+          if (bump === 'none') {
+            core.info('release:none -> skip deployment.');
+            return; // skip allowed
+          }
 
-          // tenants
+          // ---- tenant:* labels -> resolve set ⊆ {default, csu}
           const tenantLabels = labels.filter(l => l.startsWith('tenant:'));
           const set = new Set();
           if (tenantLabels.includes('tenant:both'))   { set.add('default'); set.add('csu'); }
           if (tenantLabels.includes('tenant:default')) set.add('default');
           if (tenantLabels.includes('tenant:csu'))     set.add('csu');
 
-          if (set.size === 0) return fail('At least one tenant label required (tenant:default | tenant:csu | tenant:both).');
+          if (set.size === 0) {
+            return fail('At least one tenant label required (tenant:default | tenant:csu | tenant:both).');
+          }
 
           const tenants = [...set].sort();
           core.info(`bump=${bump}, tenants=[${tenants.join(', ')}]`);
-          core.setOutput('skip', 'false');
+
+          core.setOutput('skip','false');
           core.setOutput('bump', bump);
           core.setOutput('tenants', tenants.join(','));
-
