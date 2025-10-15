@@ -45,50 +45,58 @@ runs:
             core.setOutput('invalid','true');
             core.setOutput('reason', msg);
             if (enforce) {
-              core.setFailed(msg);
-              throw new Error(msg); // ensure step fails hard
-            } else {
-              core.info(msg);
+             core.setFailed(msg);
+             throw new Error(msg); // ensure step fails hard
             }
+            core.info(msg);
           };
 
           const pr = context.payload.pull_request;
-          if (!pr) {
-            return fail('No pull_request found in event payload.');
-          }
+          if (!pr) return fail('No pull_request found in event payload.');
 
-          const labels = (pr.labels || []).map(l => l.name);
+          // Normalize labels to lowercase
+          const labels = (pr.labels || []).map(l => (l.name || '').toLowerCase());
 
-          // ---- release:* labels
+          // --- release:* ---
           const rel = labels.filter(l => l.startsWith('release:'));
           if (rel.length === 0) {
             core.info('No release label -> skip deployment.');
             return; // skip allowed
           }
           if (rel.length !== 1) {
-            return fail(`Exactly one release:* required (patch|minor|major|none). Found: ${rel.join(', ')}`);
+            return fail(`Exactly one release:* required. Found: ${rel.join(', ') || 'none'}`);
           }
 
-          const bump = rel[0].replace('release:', '');
-          if (bump === 'none') {
-            core.info('release:none -> skip deployment.');
-            return; // skip allowed
+          const bump = rel[0].slice('release:'.length);
+          const allowedRelease = new Set(['patch','minor','major','none']);
+          if (!allowedRelease.has(bump)) {
+            return fail(`Invalid release label value: '${bump}'. Use one of: patch|minor|major|none.`);
           }
 
-          // ---- tenant:* labels -> resolve set ⊆ {default, csu}
+          // --- tenants ---
           const tenantLabels = labels.filter(l => l.startsWith('tenant:'));
           const set = new Set();
           if (tenantLabels.includes('tenant:both'))   { set.add('default'); set.add('csu'); }
           if (tenantLabels.includes('tenant:default')) set.add('default');
           if (tenantLabels.includes('tenant:csu'))     set.add('csu');
 
+
+          // release:none policy
+          if (bump === 'none') {
+            if (set.size > 0) {
+              return fail('release:none with tenant labels is not allowed. Remove tenant labels or change release to patch|minor|major.');
+            }
+            core.info('release:none with no tenants -> skip.');
+            return;
+          }
+
+          // Active bump requires ≥1 tenant
           if (set.size === 0) {
             return fail('At least one tenant label required (tenant:default | tenant:csu | tenant:both).');
           }
 
           const tenants = [...set].sort();
           core.info(`bump=${bump}, tenants=[${tenants.join(', ')}]`);
-
           core.setOutput('skip','false');
           core.setOutput('bump', bump);
           core.setOutput('tenants', tenants.join(','));
