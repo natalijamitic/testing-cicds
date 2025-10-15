@@ -6,7 +6,7 @@ on:
     branches: [development]
 
 permissions:
-  contents: read #opt
+  contents: read
   pull-requests: read
 
 jobs:
@@ -24,9 +24,16 @@ jobs:
         with:
           enforce: "true"
 
-      # Optional: echo what we resolved (for visibility when valid)
+      # Belt & suspenders: if the validator flagged invalid, fail explicitly.
+      - name: Enforce invalid labeling
+        if: steps.validate.outputs.invalid == 'true'
+        run: |
+          echo "::error::${{ steps.validate.outputs.reason }}"
+          exit 1
+
+      # Optional: visibility when valid
       - name: Summary
-        if: success() && steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip != 'true'
         run: |
           echo "Release bump: ${{ steps.validate.outputs.bump }}"
           echo "Tenants: ${{ steps.validate.outputs.tenants }}"
