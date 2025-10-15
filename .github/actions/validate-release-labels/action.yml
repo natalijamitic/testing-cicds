@@ -15,6 +15,7 @@ outputs:
   tenants:
     description: "CSV of tenants (default,csu)"
     value: ${{ steps.validate.outputs.tenants }}
+
 runs:
   using: "composite"
   steps:
@@ -22,64 +23,40 @@ runs:
       uses: actions/github-script@v7
       with:
         script: |
-          // initialize outputs so they're never undefined
-          core.setOutput('skip', 'true');
-          core.setOutput('bump', 'none');
-          core.setOutput('tenants', '');
+          // default outputs
+          core.setOutput('skip','true');
+          core.setOutput('bump','none');
+          core.setOutput('tenants','');
 
           const enforce = core.getInput('enforce') === 'true';
           const pr = context.payload.pull_request;
-          const labels = (pr.labels || []).map(l => l.name);
+          const labels = (pr?.labels || []).map(l => l.name);
 
-          // 1) release label(s)
+          const fail = (msg) => {
+            if (enforce) {
+              core.setFailed(msg);
+              throw new Error(msg);   // <-- ensure step (and job) fail
+            } else {
+              core.info(msg);
+            }
+          };
+
+          // release labels
           const rel = labels.filter(l => l.startsWith('release:'));
+          if (rel.length === 0) return;  // skip allowed
+          if (rel.length !== 1) return fail(`Exactly one release:* required (patch|minor|major|none). Found: ${rel.join(', ')}`);
 
-          // No release label -> skip (allowed default)
-          if (rel.length === 0) {
-            core.info('No release label -> skip deployment.');
-            core.setOutput('skip', 'true');
-            core.setOutput('bump', 'none');
-            core.setOutput('tenants', '');
-            return;
-          }
+          const bump = rel[0].replace('release:', '');
+          if (bump === 'none') return;   // skip allowed
 
-          // Multiple release labels -> error in gate, skip otherwise
-          if (rel.length !== 1) {
-            const msg = `Exactly one release:* required (patch|minor|major|none). Found: ${rel.join(', ')}`;
-            if (enforce) core.setFailed(msg); else core.info(msg);
-            core.setOutput('skip', 'true');
-            core.setOutput('bump', 'none');
-            core.setOutput('tenants', '');
-            return;
-          }
-
-          const bump = rel[0].replace('release:', ''); // patch|minor|major|none
-
-          // Explicit no-op
-          if (bump === 'none') {
-            core.info('release:none -> skip deployment.');
-            core.setOutput('skip', 'true');
-            core.setOutput('bump', 'none');
-            core.setOutput('tenants', '');
-            return;
-          }
-
-          // 2) tenants -> build set ⊆ {default, csu}
+          // tenants
           const tenantLabels = labels.filter(l => l.startsWith('tenant:'));
           const set = new Set();
           if (tenantLabels.includes('tenant:both'))   { set.add('default'); set.add('csu'); }
           if (tenantLabels.includes('tenant:default')) set.add('default');
           if (tenantLabels.includes('tenant:csu'))     set.add('csu');
 
-          // Missing tenants when bump is active -> error in gate, skip otherwise
-          if (set.size === 0) {
-            const msg = 'At least one tenant label required (tenant:default | tenant:csu | tenant:both).';
-            if (enforce) core.setFailed(msg); else core.info(msg);
-            core.setOutput('skip', 'true');
-            core.setOutput('bump', 'none');
-            core.setOutput('tenants', '');
-            return;
-          }
+          if (set.size === 0) return fail('At least one tenant label required (tenant:default | tenant:csu | tenant:both).');
 
           const tenants = [...set].sort();
           core.info(`bump=${bump}, tenants=[${tenants.join(', ')}]`);
