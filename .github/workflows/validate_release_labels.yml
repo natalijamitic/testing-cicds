@@ -3,7 +3,7 @@ name: PR Label Gate
 on:
   pull_request:
     types: [opened, edited, labeled, unlabeled, synchronize, reopened, ready_for_review]
-    branches: [development]
+    branches: [development, staging, production]
 
 permissions:
   contents: read
