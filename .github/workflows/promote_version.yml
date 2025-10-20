@@ -18,7 +18,7 @@ on:
         type: string
         required: true
       tenants:
-        description: "Comma-separated tenants (e.g., csu or default,csu or 'both')"
+        description: "Comma-separated tenants (e.g., csu or default,csu)"
         type: string
         default: "csu"
 
@@ -28,6 +28,9 @@ permissions:
 jobs:
   promote:
     runs-on: ubuntu-latest
+    # Gate tagging and release creation behind environment approvals
+    environment: ${{ inputs.to_channel }}   # dev | staging | production
+
     concurrency:
       group: promote-${{ inputs.from_channel }}-${{ inputs.to_channel }}
       cancel-in-progress: false
@@ -50,6 +53,7 @@ jobs:
         id: tenants
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
           script: |
             const fs = require('fs');
             const path = require('path');
@@ -73,7 +77,6 @@ jobs:
           RAW_TENANTS: ${{ env.RAW_TENANTS }}
 
       # Resolve the source SHA by reading any existing tag at release/<FROM>/<tenant>/<VER>
-      # Prefer default tenant if present; fallback to any tenant that has that version.
       - name: Resolve source tag SHA
         id: source
         shell: bash
@@ -82,11 +85,9 @@ jobs:
           FROM="${FROM}"
           VER="${VER}"
 
-          # Try default first for determinism
           if git rev-parse -q --verify "refs/tags/release/${FROM}/default/${VER}" >/dev/null; then
             TAG="release/${FROM}/default/${VER}"
           else
-            # Search all tenants in source channel for the version
             TAG="$(git tag -l "release/${FROM}/*/${VER}" | head -n1 || true)"
           fi
 
@@ -106,6 +107,7 @@ jobs:
         id: tags
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
           script: |
             const to    = process.env.TO;
             const ver   = process.env.VER;
@@ -143,6 +145,7 @@ jobs:
         id: release
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
           script: |
             const to    = process.env.TO;
             const ver   = process.env.VER;
@@ -173,11 +176,12 @@ jobs:
             core.setOutput('release_id', (release.data ? release.data.id : release.id));
             core.setOutput('release_tag', tagName)
 
-      # OPTIONAL: append per-tenant deltas for the target channel/version
+      # OPTIONAL: append per-tenant delta to release notes
       - name: Append per-tenant delta to release notes
         if: steps.tags.outputs.any == 'true'
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
           script: |
             const to      = process.env.TO;
             const ver     = process.env.VER;
