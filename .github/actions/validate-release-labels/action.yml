@@ -59,9 +59,21 @@ runs:
 
           // --- release:* ---
           const rel = labels.filter(l => l.startsWith('release:'));
+
+          // --- tenants ---
+          const tenantLabels = labels.filter(l => l.startsWith('tenant:'));
+          const set = new Set();
+          if (tenantLabels.includes('tenant:both'))   { set.add('default'); set.add('csu'); }
+          if (tenantLabels.includes('tenant:default')) set.add('default');
+          if (tenantLabels.includes('tenant:csu'))     set.add('csu');
+
+          // no release policy
           if (rel.length === 0) {
+            if (set.size > 0) {
+              return fail('No release with tenant labels is not allowed. Remove tenant labels or add a release label.');
+            }
             core.info('No release label -> skip deployment.');
-            return; // skip allowed
+            return;
           }
           if (rel.length !== 1) {
             return fail(`Exactly one release:* required. Found: ${rel.join(', ') || 'none'}`);
@@ -73,26 +85,18 @@ runs:
             return fail(`Invalid release label value: '${bump}'. Use one of: patch|minor|major|none.`);
           }
 
-          // --- tenants ---
-          const tenantLabels = labels.filter(l => l.startsWith('tenant:'));
-          const set = new Set();
-          if (tenantLabels.includes('tenant:both'))   { set.add('default'); set.add('csu'); }
-          if (tenantLabels.includes('tenant:default')) set.add('default');
-          if (tenantLabels.includes('tenant:csu'))     set.add('csu');
-
-
           // release:none policy
           if (bump === 'none') {
             if (set.size > 0) {
               return fail('release:none with tenant labels is not allowed. Remove tenant labels or change release to patch|minor|major.');
             }
-            core.info('release:none with no tenants -> skip.');
+            core.info('release:none with no tenants -> skip deployment.');
             return;
           }
 
           // Active bump requires ≥1 tenant
           if (set.size === 0) {
-            return fail('At least one tenant label required (tenant:default | tenant:csu | tenant:both).');
+            return fail('At least one tenant label required (tenant:default | tenant:csu | tenant:both) since release label is set.');
           }
 
           const tenants = [...set].sort();
