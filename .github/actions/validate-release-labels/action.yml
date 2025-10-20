@@ -144,7 +144,7 @@ runs:
             return fail('At least one tenant label required (tenant:default | tenant:csu | tenant:both) since release label is set.');
           }
 
-          const tenants = [...set].sort();
+          const tenants = [...tenantSet].sort();
 
           // Defensive sanity check (should never trigger)
           const stray = tenants.filter(t => !allowed.includes(t));
