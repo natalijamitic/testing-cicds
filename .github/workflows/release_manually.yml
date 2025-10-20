@@ -1,0 +1,279 @@
+name: Manual Release (tag given SHA)
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Environment/channel"
+        type: choice
+        options: [dev, staging, production]
+        default: staging
+      bump:
+        description: "SemVer bump"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      tenants:
+        description: "Comma-separated tenants (must match .github/tenants.json or 'both')"
+        type: string
+        default: "default"
+      sha:
+        description: "Commit SHA to tag (must exist in repo)"
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  manual-release:
+    name: Release ${{ inputs.channel }} @ ${{ inputs.sha }}
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: manual-release-${{ inputs.channel }}
+      cancel-in-progress: false
+
+    env:
+      CHANNEL: ${{ inputs.channel }}
+      BUMP: ${{ inputs.bump }}
+      RAW_TENANTS: ${{ inputs.tenants }}
+      TARGET_SHA: ${{ inputs.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all refs
+        run: |
+          git fetch --all --tags --force --quiet
+
+      - name: Validate SHA exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null; then
+            echo "::error::SHA ${TARGET_SHA} is not a valid commit in this repository."
+            exit 1
+          fi
+
+      - name: Load & validate tenants from .github/tenants.json
+        id: tenants
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const cfgPath = path.join(process.env.GITHUB_WORKSPACE, '.github', 'tenants.json');
+            if (!fs.existsSync(cfgPath)) {
+              core.setFailed(`Missing ${cfgPath}.`);
+              return;
+            }
+            const { tenants: allowed } = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+            if (!Array.isArray(allowed) || allowed.length === 0) {
+              core.setFailed(`.github/tenants.json has no 'tenants' array.`);
+              return;
+            }
+
+            const raw = (process.env.RAW_TENANTS || '').replace(/\s+/g, '');
+            if (!raw) {
+              core.setFailed('No tenants provided.');
+              return;
+            }
+
+            let list;
+            if (raw.toLowerCase() === 'both') {
+              list = [...allowed];
+            } else {
+              list = [...new Set(raw.split(',').filter(Boolean))];
+              const invalid = list.filter(t => !allowed.includes(t));
+              if (invalid.length) {
+                core.setFailed(`Unknown tenant(s): ${invalid.join(', ')}. Allowed: ${allowed.join(', ')}, or 'both' for all.`);
+                return;
+              }
+            }
+
+            core.info(`Allowed: ${allowed.join(', ')}`);
+            core.info(`Using tenants: ${list.join(', ')}`);
+            core.setOutput('csv', list.join(','));
+        env:
+          RAW_TENANTS: ${{ env.RAW_TENANTS }}
+
+      - name: Compute next version (scoped to channel)
+        id: semver
+        shell: bash
+        run: |
+          set -euo pipefail
+          CH="${CHANNEL}"
+          BUMP="${BUMP}"
+
+          LATEST=$(
+            git for-each-ref "refs/tags/release/${CH}/*/*" --format='%(refname:short)' \
+            | awk -F'/' '{print $4}' \
+            | sort -V \
+            | tail -n1
+          )
+          [[ -z "${LATEST}" ]] && LATEST="0.0.0"
+
+          IFS='.' read -r MA MI PA <<< "${LATEST}"
+
+          case "${BUMP}" in
+            patch)  PA=$((PA+1)) ;;
+            minor)  MI=$((MI+1)); PA=0 ;;
+            major)  MA=$((MA+1)); MI=0; PA=0 ;;
+            *) echo "::error::Unknown bump: ${BUMP}"; exit 1 ;;
+          esac
+
+          NEXT="${MA}.${MI}.${PA}"
+          echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "Next version for ${CH}: ${NEXT}"
+
+      - name: Create/verify tags for tenants
+        id: tags
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const channel  = process.env.CHANNEL;
+            const next     = '${{ steps.semver.outputs.next }}';
+            const mergeSha = process.env.TARGET_SHA;
+            const tenants  = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            let any = false;
+            for (const t of tenants) {
+              const tag = `release/${channel}/${t}/${next}`;
+              try {
+                const ref = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+                core.info(`Tag exists: ${tag} -> ${ref.data?.object?.sha}`);
+                any = true;
+              } catch (e) {
+                if (e.status === 404) {
+                  try {
+                    core.info(`Creating tag ${tag} at ${mergeSha}`);
+                    await github.rest.git.createRef({
+                      owner, repo,
+                      ref: `refs/tags/${tag}`,
+                      sha: mergeSha
+                    });
+                    any = true;
+                  } catch (err) {
+                    core.warning(`Failed to create ${tag}: ${err.message}`);
+                  }
+                } else {
+                  core.warning(`Failed to check ${tag}: ${e.message}`);
+                }
+              }
+            }
+            core.setOutput('any', any ? 'true' : 'false');
+
+      - name: Stop if no tags exist/were created
+        if: steps.tags.outputs.any != 'true'
+        run: echo "No tenant tags present for this version — skipping GitHub Release."
+
+      - name: Create canonical GitHub Release
+        if: steps.tags.outputs.any == 'true'
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const channel = process.env.CHANNEL;
+            const next    = '${{ steps.semver.outputs.next }}';
+            const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
+
+            const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
+            const tagName = `release/${channel}/${canonicalTenant}/${next}`;
+
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
+              core.info(`Release for ${tagName} already exists.`);
+            } catch (e) {
+              if (e.status === 404) {
+                core.info(`Creating GitHub release for ${tagName}`);
+                release = await github.rest.repos.createRelease({
+                  owner, repo,
+                  tag_name: tagName,
+                  name: `${channel} ${next}`,
+                  generate_release_notes: true,
+                  draft: false,
+                  prerelease: channel !== 'production'
+                });
+              } else {
+                throw e;
+              }
+            }
+            core.setOutput('release_id', (release.data ? release.data.id : release.id));
+            core.setOutput('release_tag', tagName);
+
+      - name: Append per-tenant delta to release body
+        if: steps.tags.outputs.any == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const channel = process.env.CHANNEL;
+            const next    = '${{ steps.semver.outputs.next }}';
+            const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
+            const tagName = `release/${channel}/${canonicalTenant}/${next}`;
+            const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
+            let body = rel.data.body || '';
+
+            function semverCmp(a, b) {
+              const pa = a.split('.').map(Number);
+              const pb = b.split('.').map(Number);
+              for (let i = 0; i < 3; i++) {
+                const da = pa[i] || 0, db = pb[i] || 0;
+                if (da < db) return -1;
+                if (da > db) return 1;
+              }
+              return 0;
+            }
+            const semverLess = (a, b) => semverCmp(a, b) < 0;
+
+            async function findPrevTagForTenant(t) {
+              const prefix = `tags/release/${channel}/${t}/`;
+              const { data: refs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: prefix });
+              const versions = refs
+                .map(r => r.ref.split('/').slice(-1)[0])
+                .filter(v => v && v !== next)
+                .sort((a,b) => semverCmp(a,b));
+              const prev = versions.filter(v => semverLess(v, next)).pop();
+              return prev ? `release/${channel}/${t}/${prev}` : null;
+            }
+
+            for (const t of tenants) {
+              const prevTag = await findPrevTagForTenant(t);
+              const newTag  = `release/${channel}/${t}/${next}`;
+
+              if (!prevTag) {
+                body += `\n\n### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${channel}/${t}/\`._`;
+                continue;
+              }
+
+              const compare = await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${prevTag}...${newTag}`
+              });
+
+              const lines = (compare.data.commits || []).map(c => {
+                const title = (c.commit?.message || '').split('\n')[0];
+                const sha = (c.sha || '').slice(0,7);
+                return `- ${title} (${sha})`;
+              });
+
+              body += `\n\n### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${next}**_\n` + (lines.length ? lines.join('\n') : '_No changes_');
+            }
+
+            await github.rest.repos.updateRelease({
+              owner, repo,
+              release_id: rel.data.id,
+              body
+            })
