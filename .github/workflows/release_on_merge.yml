@@ -1,4 +1,4 @@
-name: Auto tag and release on merge to development
+name: Auto tag and release on merge to develop/staging/production
 
 on:
   pull_request:
@@ -8,16 +8,21 @@ permissions:
   contents: write
   pull-requests: read
 
-concurrency:
-  group: release-dev
-  cancel-in-progress: false
-
 jobs:
   tag-on-merge:
-    if: >
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.base.ref == 'development'
+    if: github.event.pull_request.merged == true &&
+        (github.event.pull_request.base.ref == 'develop' ||
+         github.event.pull_request.base.ref == 'staging' ||
+         github.event.pull_request.base.ref == 'production')
     runs-on: ubuntu-latest
+
+    # Concurrency per channel so dev/staging/prod don't block each other
+    concurrency:
+      group: release-${{ github.event.pull_request.base.ref }}
+      cancel-in-progress: false
+
+    env:
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
 
     steps:
       - name: Checkout repo
@@ -25,7 +30,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 1) Parse labels via shared composite (no failing; just skip if invalid/none)
+      # Resolve channel (dev|staging|production) from base branch
+      - name: Resolve release channel
+        id: channel
+        run: |
+          case "${BASE_REF}" in
+            develop)    CHANNEL="dev" ;;
+            staging)    CHANNEL="staging" ;;
+            production) CHANNEL="production" ;;
+            *) echo "Unsupported base ref: ${BASE_REF}"; exit 1 ;;
+          esac
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "CHANNEL=${CHANNEL}" >> "$GITHUB_ENV"
+
+      # Parse labels → bump + tenants (your shared composite)
       - name: Derive labels (bump + tenants)
         id: labels
         uses: ./.github/actions/validate-release-labels
@@ -50,7 +68,7 @@ jobs:
         if: steps.guard.outputs.skip != 'true' && steps.guard.outputs.invalid != 'true'
         run: git fetch --tags --force --quiet
 
-      # 2) Compute next SemVer (global across tenants).
+      # Compute next SemVer within the current channel (dev|staging|production)
       - name: Compute next version
         if: steps.guard.outputs.skip != 'true' && steps.guard.outputs.invalid != 'true'
         id: semver
@@ -58,9 +76,10 @@ jobs:
         run: |
           set -euo pipefail
           BUMP="${{ steps.labels.outputs.bump }}"
+          CH="${CHANNEL}"
 
           LATEST=$(
-            git for-each-ref 'refs/tags/release/dev/*/*' --format='%(refname:short)' \
+            git for-each-ref "refs/tags/release/${CH}/*/*" --format='%(refname:short)' \
             | awk -F'/' '{print $4}' \
             | sort -V \
             | tail -n1
@@ -82,13 +101,14 @@ jobs:
           echo "LATEST=${LATEST}"
           echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
 
-      # 3) Create tenant tags (idempotent). Output whether *any* tag exists/was created.
+      # Create/verify tags for each tenant under the channel prefix
       - name: Create/verify tags for tenants
         if: steps.guard.outputs.skip != 'true' && steps.guard.outputs.invalid != 'true'
         id: tags
         uses: actions/github-script@v7
         with:
           script: |
+            const channel  = process.env.CHANNEL; // dev|staging|production
             const next     = '${{ steps.semver.outputs.next }}';
             const mergeSha = context.payload.pull_request.merge_commit_sha;
             const tenants  = '${{ steps.labels.outputs.tenants }}'.split(',').filter(Boolean);
@@ -97,7 +117,7 @@ jobs:
 
             let any = false;
             for (const t of tenants) {
-              const tag = `release/dev/${t}/${next}`;
+              const tag = `release/${channel}/${t}/${next}`;
               try {
                 const ref = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
                 core.info(`Tag exists: ${tag} -> ${ref.data?.object?.sha}`);
@@ -126,23 +146,23 @@ jobs:
         if: steps.tags.outputs.any != 'true'
         run: echo "No tenant tags present for this version — skipping GitHub Release."
 
-      # 4) Create ONE canonical GitHub Release (only if we confirmed tags exist)
+      # Create ONE canonical GitHub Release for the channel (dev/staging/production)
       - name: Create canonical GitHub Release
         if: steps.tags.outputs.any == 'true'
         id: release
         uses: actions/github-script@v7
         with:
           script: |
+            const channel = process.env.CHANNEL; // dev|staging|production
             const next    = '${{ steps.semver.outputs.next }}';
             const tenants = '${{ steps.labels.outputs.tenants }}'.split(',').filter(Boolean);
 
-            // Prefer "default"; otherwise pick the first tenant in the sorted set.
             const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
-            const tagName = `release/dev/${canonicalTenant}/${next}`;
+            const tagName = `release/${channel}/${canonicalTenant}/${next}`;
+
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
-            // Ensure the release exists (generate release notes from previous release)
             let release;
             try {
               release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
@@ -153,10 +173,10 @@ jobs:
                 release = await github.rest.repos.createRelease({
                   owner, repo,
                   tag_name: tagName,
-                  name: `dev ${next}`,
+                  name: `${channel} ${next}`,
                   generate_release_notes: true,
                   draft: false,
-                  prerelease: false
+                  prerelease: channel !== 'production' // dev/staging as prereleases, prod as final
                 });
               } else {
                 throw e;
@@ -165,56 +185,53 @@ jobs:
 
             core.setOutput('release_id', (release.data ? release.data.id : release.id));
             core.setOutput('release_tag', tagName);
-      # 5) Append per-tenant deltas (only if we made/saw tags)
+
+      # Append per-tenant deltas to the single channel release
       - name: Append per-tenant delta to release body
         if: steps.tags.outputs.any == 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const next     = '${{ steps.semver.outputs.next }}';
-            const tenants  = '${{ steps.labels.outputs.tenants }}'.split(',').filter(Boolean);
+            const channel = process.env.CHANNEL;
+            const next    = '${{ steps.semver.outputs.next }}';
+            const tenants = '${{ steps.labels.outputs.tenants }}'.split(',').filter(Boolean);
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
-            // Fetch the canonical release we created earlier
             const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
-            const tagName = `release/dev/${canonicalTenant}/${next}`;
+            const tagName = `release/${channel}/${canonicalTenant}/${next}`;
             const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
             let body = rel.data.body || '';
 
-            // Minimal semver comparator
             function semverCmp(a, b) {
-                const pa = a.split('.').map(Number);
-                const pb = b.split('.').map(Number);
-                for (let i = 0; i < 3; i++) {
+              const pa = a.split('.').map(Number);
+              const pb = b.split('.').map(Number);
+              for (let i = 0; i < 3; i++) {
                 const da = pa[i] || 0, db = pb[i] || 0;
                 if (da < db) return -1;
                 if (da > db) return 1;
-                }
-                return 0;
+              }
+              return 0;
             }
             const semverLess = (a, b) => semverCmp(a, b) < 0;
 
-            // For a tenant, fetch only refs under its prefix using Matching Refs API
             async function findPrevTagForTenant(t) {
-                const prefix = `tags/release/dev/${t}/`; // NOTE: Matching Refs needs 'tags/...'
-                const { data: refs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: prefix });
-                // refs[*].ref looks like 'refs/tags/release/dev/<tenant>/<version>'
-                const versions = refs
-                .map(r => r.ref.split('/').slice(-1)[0])     // grab the last path part (X.Y.Z)
+              const prefix = `tags/release/${channel}/${t}/`;
+              const { data: refs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: prefix });
+              const versions = refs
+                .map(r => r.ref.split('/').slice(-1)[0])
                 .filter(v => v && v !== next)
-                .sort((a,b) => semverCmp(a,b));             // ascending semver
-                // pick the greatest version strictly less than NEXT
-                const prev = versions.filter(v => semverLess(v, next)).pop();
-                return prev ? `release/dev/${t}/${prev}` : null;
+                .sort((a,b) => semverCmp(a,b));
+              const prev = versions.filter(v => semverLess(v, next)).pop();
+              return prev ? `release/${channel}/${t}/${prev}` : null;
             }
 
             for (const t of tenants) {
               const prevTag = await findPrevTagForTenant(t);
-              const newTag  = `release/dev/${t}/${next}`;
+              const newTag  = `release/${channel}/${t}/${next}`;
 
               if (!prevTag) {
-                body += `\n\n### ${t.toUpperCase()} changes\n_No previous tag found. Full history up to \`${newTag}\`._`;
+                body += `\n\n### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${channel}/${t}/\`._`;
                 continue;
               }
 
