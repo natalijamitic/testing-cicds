@@ -42,6 +42,13 @@ jobs:
       RAW_TENANTS: ${{ inputs.tenants }}
 
     steps:
+      - name: Show promotion inputs
+        run: |
+          echo "from_channel: ${{ inputs.from_channel }}"
+          echo "to_channel: ${{ inputs.to_channel }}"
+          echo "version: ${{ inputs.version }}"
+          echo "tenants: ${{ inputs.tenants }}"
+
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
