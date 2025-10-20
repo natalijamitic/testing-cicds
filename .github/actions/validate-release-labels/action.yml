@@ -1,0 +1,158 @@
+name: Validate release & tenant labels
+description: Parses PR labels (release:* + tenant:*) into bump/tenants and decides skip.
+
+inputs:
+  enforce:
+    description: "Fail if invalid labels (PR gate mode)"
+    required: false
+    default: "false"
+
+outputs:
+  skip:
+    description: "true if tagging/deploy should be skipped"
+    value: ${{ steps.validate.outputs.skip }}
+  bump:
+    description: "patch|minor|major|none"
+    value: ${{ steps.validate.outputs.bump }}
+  tenants:
+    description: "CSV of tenants (default,csu)"
+    value: ${{ steps.validate.outputs.tenants }}
+  invalid:
+    description: "true if labeling is invalid"
+    value: ${{ steps.validate.outputs.invalid }}
+  reason:
+    description: "human-readable reason for invalid labeling"
+    value: ${{ steps.validate.outputs.reason }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: validate
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // Always initialize outputs so they're never undefined
+          core.setOutput('skip','true');
+          core.setOutput('bump','none');
+          core.setOutput('tenants','');
+          core.setOutput('invalid','false');
+          core.setOutput('reason','');
+
+          const enforce = core.getInput('enforce') === 'true';
+          core.info(`validator: enforce=${enforce}`);
+
+          const fail = (msg) => {
+            core.setOutput('invalid','true');
+            core.setOutput('reason', msg);
+            if (enforce) {
+             core.setFailed(msg);
+             throw new Error(msg); // ensure step fails hard
+            }
+            core.info(msg);
+          };
+
+          const pr = context.payload.pull_request;
+          if (!pr) return fail('No pull_request found in event payload.');
+
+          // ----------------------------
+          // Load allowed tenants from repo
+          // ----------------------------
+          const fs = require('fs');
+          const path = require('path');
+          const cfgPath = path.join(process.env.GITHUB_WORKSPACE || '.', '.github', 'tenants.json');
+
+          if (!fs.existsSync(cfgPath)) {
+            return fail(`Missing ${cfgPath}. Create it with: {"tenants": ["default","csu"]}`);
+          }
+
+          let allowed = [];
+          try {
+            const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+            if (!Array.isArray(parsed.tenants)) {
+              return fail(`.github/tenants.json missing "tenants" array.`);
+            }
+            allowed = parsed.tenants.map(String).map(t => t.toLowerCase());
+          } catch (e) {
+            return fail(`Failed to parse ${cfgPath}: ${e.message}`);
+          }
+
+          if (allowed.length === 0) {
+            return fail(`.github/tenants.json has an empty "tenants" array.`);
+          }
+
+          core.info(`Allowed tenants: ${allowed.join(', ')}`);
+
+          // Normalize labels to lowercase
+          const labels = (pr.labels || []).map(l => (l.name || '').toLowerCase()).filter(Boolean);
+          core.info(`PR labels: ${labels.join(', ') || '(none)'}`);
+
+          // --- release:* ---
+          const rel = labels.filter(l => l.startsWith('release:'));
+
+          // --- tenants ---
+          const tenantLabels = labels.filter(l => l.startsWith('tenant:'));
+
+          // Build a set of tenants
+          const tenantSet = new Set();
+
+          // Special convenience: tenant:both => all allowed tenants
+          if (tenantLabels.includes('tenant:both')) {
+            for (const t of allowed) tenantSet.add(t);
+          }
+
+          for (const tl of tenantLabels) {
+            const name = tl.slice('tenant:'.length);
+            if (name === 'both') continue; // already handled
+            if (!allowed.includes(name)) {
+              return fail(
+                `Unknown tenant label '${tl}'. Allowed: ${allowed.join(', ')}. ` +
+                `Use 'tenant:both' to target all tenants.`
+              );
+            }
+            tenantSet.add(name);
+          }
+
+          // no release policy
+          if (rel.length === 0) {
+            if (tenantSet.size > 0) {
+              return fail('No release with tenant labels is not allowed. Remove tenant labels or add a release label.');
+            }
+            core.info('No release label -> skip deployment.');
+            return;
+          }
+          if (rel.length !== 1) {
+            return fail(`Exactly one release:* required. Found: ${rel.join(', ') || 'none'}`);
+          }
+
+          const bump = rel[0].slice('release:'.length);
+          const allowedRelease = new Set(['patch','minor','major','none']);
+          if (!allowedRelease.has(bump)) {
+            return fail(`Invalid release label value: '${bump}'. Use one of: patch|minor|major|none.`);
+          }
+
+          // release:none policy
+          if (bump === 'none') {
+            if (tenantSet.size > 0) {
+              return fail('release:none with tenant labels is not allowed. Remove tenant labels or change release to patch|minor|major.');
+            }
+            core.info('release:none with no tenants -> skip deployment.');
+            return;
+          }
+
+          // Active bump requires ≥1 tenant
+          if (tenantSet.size === 0) {
+            return fail('At least one tenant label required (tenant:default | tenant:csu | tenant:both) since release label is set.');
+          }
+
+          const tenants = [...set].sort();
+
+          // Defensive sanity check (should never trigger)
+          const stray = tenants.filter(t => !allowed.includes(t));
+          if (stray.length) {
+            return fail(`Validator error: derived invalid tenant(s): ${stray.join(', ')}`);
+          }
+
+          core.info(`bump=${bump}, tenants=[${tenants.join(', ')}]`);
+          core.setOutput('skip','false');
+          core.setOutput('bump', bump);
+          core.setOutput('tenants', tenants.join(','));
