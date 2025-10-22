@@ -285,7 +285,7 @@ jobs:
                 return `- ${title} (${sha})`;
               });
 
-              const content = `### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${next}**_\n[Full changelog for ${t}](${compareUrl})\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
+              const content = `### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${next}**_:[full changelog for ${t}](${compareUrl})\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
               body = upsertSection(body, `tenant:${channel}:${t}:${next}`, content);
             }
 
