@@ -236,7 +236,7 @@ jobs:
 
               let section;
               if (!prevTag) {
-                section = `### ${t.toUpperCase()} changes\n_No previous tag found in \\`release/${ch}/${t}/\\`._`;
+                section = `\### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${to}/${t}/\`._`;
               } else {
                 const cmp = await github.rest.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${prevTag}...${newTag}` });
                 const lines = (cmp.data.commits||[]).map(c=>{
