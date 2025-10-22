@@ -46,9 +46,8 @@ jobs:
       - name: Fetch all refs
         run: git fetch --all --tags --force --quiet
 
-      # --- OPTIONAL GUARD (enable if you want an allowlist) ---
-      # Create a file .github/promotion-allowlist.json with: { "users": ["octocat","alice"] }
-      - name: (Optional) Guard: allowlisted users only
+      # Create a file .github/promotion-allowlist
+      - name: Guard allowlisted users only
         if: ${{ hashFiles('.github/promotion-allowlist.json') != '' }}
         uses: actions/github-script@v7
         with:
@@ -129,12 +128,12 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const ch     = process.env.CH;
-            const ver    = process.env.VER;
-            const sha    = '${{ steps.source.outputs.sha }}';
+            const ch      = process.env.CH;
+            const ver     = process.env.VER;
+            const sha     = '${{ steps.source.outputs.sha }}';
             const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
-            const owner  = context.repo.owner;
-            const repo   = context.repo.repo;
+            const owner   = context.repo.owner;
+            const repo    = context.repo.repo;
 
             let any = false;
             for (const t of tenants) {
@@ -166,33 +165,71 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const ch     = process.env.CH;
-            const ver    = process.env.VER;
+            const ch      = process.env.CH;
+            const ver     = process.env.VER;
             const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
-            const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
-            const tagName = `release/${ch}/${canonicalTenant}/${ver}`;
-            const owner = context.repo.owner;
-            const repo  = context.repo.repo;
+            const owner   = context.repo.owner;
+            const repo    = context.repo.repo;
 
-            let release;
-            try {
-              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
-              core.info(`Release exists for ${tagName}`);
-            } catch (e) {
-              if (e.status === 404) {
-                core.info(`Creating release for ${tagName}`);
-                release = await github.rest.repos.createRelease({
-                  owner, repo,
-                  tag_name: tagName,
-                  name: `${ch} ${ver}`,
-                  generate_release_notes: true,
-                  draft: false,
-                  prerelease: ch !== 'production'
-                });
-              } else { throw e; }
+            async function tryGetReleaseByTag(tag) {
+              try {
+                const r = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+                return r;
+              } catch (e) {
+                if (e.status === 404) return null;
+                throw e;
+              }
             }
-            core.setOutput('release_id', (release.data ? release.data.id : release.id));
-            core.setOutput('release_tag', tagName)
+
+            async function tagExists(tag) {
+              try {
+                await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+                return true;
+              } catch (e) {
+                if (e.status === 404) return false;
+                throw e;
+              }
+            }
+
+            // 1) Prefer existing release on default tag
+            let canonicalTag = `release/${ch}/default/${ver}`;
+            let rel = await tryGetReleaseByTag(canonicalTag);
+
+            // 2) If not found, see if ANY tenant already has a release for this version
+            if (!rel) {
+              const { data: refs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: `tags/release/${ch}/` });
+              const candidates = refs
+                .map(r => r.ref.replace('refs/tags/',''))
+                .filter(ref => ref.endsWith(`/${ver}`));
+              for (const t of candidates) {
+                const r = await tryGetReleaseByTag(t);
+                if (r) { canonicalTag = t; rel = r; break; }
+              }
+            }
+
+            // 3) If still not found, create a new release anchored to an existing tag
+            if (!rel) {
+              // prefer default tag if it exists; else first requested tenant tag
+              const defaultTagExists = await tagExists(`release/${ch}/default/${ver}`);
+              canonicalTag = defaultTagExists
+                ? `release/${ch}/default/${ver}`
+                : `release/${ch}/${(tenants[0] || 'default')}/${ver}`;
+
+              core.info(`Creating release for ${canonicalTag}`);
+              rel = await github.rest.repos.createRelease({
+                owner, repo,
+                tag_name: canonicalTag,
+                name: `${ch} ${ver}`,
+                generate_release_notes: true,
+                draft: false,
+                prerelease: ch !== 'production'
+              });
+            } else {
+              core.info(`Reusing existing release for ${canonicalTag}`);
+            }
+
+            core.setOutput('release_id', (rel.data ? rel.data.id : rel.id));
+            core.setOutput('release_tag', canonicalTag)
 
       - name: Upsert per-tenant delta in release notes
         if: steps.tags.outputs.any == 'true'
@@ -204,11 +241,9 @@ jobs:
             const owner   = context.repo.owner;
             const repo    = context.repo.repo;
             const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
+            const canonicalTag = '${{ steps.release.outputs.release_tag }}';
 
-            const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
-            const tagName = `release/${ch}/${canonicalTenant}/${ver}`;
-
-            const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
+            const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: canonicalTag });
             let body = rel.data.body || '';
 
             function semverCmp(a,b){const pa=a.split('.').map(Number),pb=b.split('.').map(Number);for(let i=0;i<3;i++){if((pa[i]||0)<(pb[i]||0))return-1;if((pa[i]||0)>(pb[i]||0))return 1}return 0}
@@ -237,7 +272,7 @@ jobs:
 
               let section;
               if (!prevTag) {
-                section = `### ${t.toUpperCase()} changes\n_No previous tag found in \\`release/${ch}/${t}/\\`._`;
+                section = `### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${ch}/${t}/\`._`;
               } else {
                 const cmp = await github.rest.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${prevTag}...${newTag}` });
                 const lines = (cmp.data.commits||[]).map(c=>{

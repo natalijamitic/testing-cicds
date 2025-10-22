@@ -157,30 +157,58 @@ jobs:
             const next    = '${{ steps.semver.outputs.next }}';
             const tenants = '${{ steps.labels.outputs.tenants }}'.split(',').filter(Boolean);
 
-            const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
-            const tagName = `release/${channel}/${canonicalTenant}/${next}`;
-
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
+            // Always use DEFAULT as canonical when possible
+            const canonicalTenant = 'default';
+
+            const tagName = `release/${channel}/${canonicalTenant}/${next}`;
+
+            // Find previous DEFAULT tag for this channel (strictly less than 'next')
+            function semverCmp(a,b){const pa=a.split('.').map(Number),pb=b.split('.').map(Number);for(let i=0;i<3;i++){if((pa[i]||0)<(pb[i]||0))return-1;if((pa[i]||0)>(pb[i]||0))return 1}return 0}
+            const semverLess=(a,b)=>semverCmp(a,b)<0;
+
+            const { data: refs } = await github.rest.git.listMatchingRefs({
+              owner, repo, ref: `tags/release/${channel}/${canonicalTenant}/`
+            });
+            const versions = refs
+              .map(r => r.ref.split('/').pop())
+              .filter(v => v && v !== next)
+              .sort(semverCmp);
+            const prev = versions.filter(v => semverLess(v, next)).pop();
+            const prevTagName = prev ? `release/${channel}/${canonicalTenant}/${prev}` : undefined;
+
+            // Try to reuse existing release
             let release;
             try {
               release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
               core.info(`Release for ${tagName} already exists.`);
             } catch (e) {
-              if (e.status === 404) {
-                core.info(`Creating GitHub release for ${tagName}`);
-                release = await github.rest.repos.createRelease({
+              if (e.status !== 404) throw e;
+
+              // Generate notes with explicit previous_tag_name (if we have one)
+              let body = '';
+              try {
+                const gen = await github.rest.repos.generateReleaseNotes({
                   owner, repo,
                   tag_name: tagName,
-                  name: `${channel} ${next}`,
-                  generate_release_notes: true,
-                  draft: false,
-                  prerelease: channel !== 'production' // dev/staging as prereleases, prod as final
+                  previous_tag_name: prevTagName,
                 });
-              } else {
-                throw e;
+                body = gen.data.body || '';
+              } catch (err) {
+                core.warning(`generateReleaseNotes failed: ${err.message}`);
               }
+
+              core.info(`Creating GitHub release for ${tagName}`);
+              release = await github.rest.repos.createRelease({
+                owner, repo,
+                tag_name: tagName,
+                name: `${channel} ${next}`,
+                body,                          
+                draft: false,
+                prerelease: channel !== 'production'
+              });
             }
 
             core.setOutput('release_id', (release.data ? release.data.id : release.id));
@@ -198,7 +226,8 @@ jobs:
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
-            const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
+            // Always use 'default' for the canonical release, same as the create step
+            const canonicalTenant = 'default';
             const tagName = `release/${channel}/${canonicalTenant}/${next}`;
             const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
             let body = rel.data.body || '';
@@ -221,9 +250,18 @@ jobs:
               const versions = refs
                 .map(r => r.ref.split('/').slice(-1)[0])
                 .filter(v => v && v !== next)
-                .sort((a,b) => semverCmp(a,b));
+                .sort(semverCmp);
               const prev = versions.filter(v => semverLess(v, next)).pop();
               return prev ? `release/${channel}/${t}/${prev}` : null;
+            }
+
+            // (Optional) helper to upsert a stable section per tenant to avoid duplicates
+            function upsertSection(body, key, content) {
+              const start = `<!-- BEGIN:${key} -->`;
+              const end   = `<!-- END:${key} -->`;
+              const block = `${start}\n${content}\n${end}`;
+              const re = new RegExp(`${start}[\\s\\S]*?${end}`, 'm');
+              return re.test(body) ? body.replace(re, block) : `${body.trim()}\n\n${block}\n`;
             }
 
             for (const t of tenants) {
@@ -231,7 +269,8 @@ jobs:
               const newTag  = `release/${channel}/${t}/${next}`;
 
               if (!prevTag) {
-                body += `\n\n### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${channel}/${t}/\`._`;
+                const content = `### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${channel}/${t}/\`._`;
+                body = upsertSection(body, `tenant:${channel}:${t}:${next}`, content);
                 continue;
               }
 
@@ -239,17 +278,20 @@ jobs:
                 owner, repo, basehead: `${prevTag}...${newTag}`
               });
 
+              const compareUrl = compare.data.html_url || `https://github.com/${owner}/${repo}/compare/${prevTag}...${newTag}`;
               const lines = (compare.data.commits || []).map(c => {
                 const title = (c.commit?.message || '').split('\n')[0];
                 const sha = (c.sha || '').slice(0,7);
                 return `- ${title} (${sha})`;
               });
 
-              body += `\n\n### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${next}**_\n` + (lines.length ? lines.join('\n') : '_No changes_');
+              const content = `### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${next}**_\n[Full changelog for ${t}](${compareUrl})\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
+              body = upsertSection(body, `tenant:${channel}:${t}:${next}`, content);
             }
 
             await github.rest.repos.updateRelease({
               owner, repo,
               release_id: rel.data.id,
               body
-            })
+            });
+
