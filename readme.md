@@ -8,3 +8,4 @@ novo
 novo
 brb
 scasta
+jos jedna izmena za dev

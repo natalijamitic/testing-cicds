@@ -1,20 +1,15 @@
-name: Promote existing version (copy tags across tenants/envs)
+name: Promote tenant to existing release (same channel)
 
 on:
   workflow_dispatch:
     inputs:
-      from_channel:
-        description: "Source env"
+      channel:
+        description: "Environment/channel (same-channel only)"
         type: choice
         options: [dev, staging, production]
         default: dev
-      to_channel:
-        description: "Target env"
-        type: choice
-        options: [dev, staging, production]
-        default: staging
       version:
-        description: "X.Y.Z to promote (must exist in source)"
+        description: "X.Y.Z to promote (must already exist under the chosen channel)"
         type: string
         required: true
       tenants:
@@ -28,24 +23,20 @@ permissions:
 jobs:
   promote:
     runs-on: ubuntu-latest
-    # Gate tagging and release creation behind environment approvals
-    environment: ${{ inputs.to_channel }}   # dev | staging | production
 
     concurrency:
-      group: promote-${{ inputs.from_channel }}-${{ inputs.to_channel }}
+      group: promote-sync-${{ inputs.channel }}
       cancel-in-progress: false
 
     env:
-      FROM: ${{ inputs.from_channel }}
-      TO: ${{ inputs.to_channel }}
+      CH:  ${{ inputs.channel }}
       VER: ${{ inputs.version }}
       RAW_TENANTS: ${{ inputs.tenants }}
 
     steps:
-      - name: Show promotion inputs
+      - name: Show inputs
         run: |
-          echo "from_channel: ${{ inputs.from_channel }}"
-          echo "to_channel: ${{ inputs.to_channel }}"
+          echo "channel: ${{ inputs.channel }}"
           echo "version: ${{ inputs.version }}"
           echo "tenants: ${{ inputs.tenants }}"
 
@@ -55,12 +46,34 @@ jobs:
       - name: Fetch all refs
         run: git fetch --all --tags --force --quiet
 
+      # --- OPTIONAL GUARD (enable if you want an allowlist) ---
+      # Create a file .github/promotion-allowlist.json with: { "users": ["octocat","alice"] }
+      - name: (Optional) Guard: allowlisted users only
+        if: ${{ hashFiles('.github/promotion-allowlist.json') != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const p = path.join(process.env.GITHUB_WORKSPACE,'.github','promotion-allowlist.json');
+            const actor = context.actor.toLowerCase();
+            try {
+              const { users=[] } = JSON.parse(fs.readFileSync(p,'utf8'));
+              const ok = users.map(u=>String(u).toLowerCase()).includes(actor);
+              if (!ok) {
+                core.setFailed(`User @${actor} is not in promotion allowlist. Add to .github/promotion-allowlist.json to proceed.`);
+              } else {
+                core.info(`@${actor} is allowed to promote.`);
+              }
+            } catch (e) {
+              core.setFailed(`Invalid promotion-allowlist.json: ${e.message}`);
+            }
+
       # Load tenants allow-list from .github/tenants.json and validate input (supports 'both')
       - name: Validate tenants (single source of truth)
         id: tenants
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
           script: |
             const fs = require('fs');
             const path = require('path');
@@ -83,24 +96,25 @@ jobs:
         env:
           RAW_TENANTS: ${{ env.RAW_TENANTS }}
 
-      # Resolve the source SHA by reading any existing tag at release/<FROM>/<tenant>/<VER>
+      # Resolve the source SHA by reading any existing tag at release/<CH>/<tenant>/<VER>
+      # Prefer default tenant if present; fallback to any tenant that has that version.
       - name: Resolve source tag SHA
         id: source
         shell: bash
         run: |
           set -euo pipefail
-          FROM="${FROM}"
+          CH="${CH}"
           VER="${VER}"
 
-          if git rev-parse -q --verify "refs/tags/release/${FROM}/default/${VER}" >/dev/null; then
-            TAG="release/${FROM}/default/${VER}"
+          if git rev-parse -q --verify "refs/tags/release/${CH}/default/${VER}" >/dev/null; then
+            TAG="release/${CH}/default/${VER}"
           else
-            TAG="$(git tag -l "release/${FROM}/*/${VER}" | head -n1 || true)"
+            TAG="$(git tag -l "release/${CH}/*/${VER}" | head -n1 || true)"
           fi
 
           if [[ -z "${TAG}" ]]; then
-            echo "::error::No tag found for version ${VER} in channel ${FROM}."
-            echo "Looked for: release/${FROM}/default/${VER} or release/${FROM}/*/${VER}"
+            echo "::error::No tag found for version ${VER} in channel ${CH}."
+            echo "Looked for: release/${CH}/default/${VER} or release/${CH}/*/${VER}"
             exit 1
           fi
 
@@ -109,23 +123,22 @@ jobs:
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "Found ${TAG} -> ${SHA}"
 
-      # Create tags in the target channel at the same SHA for each requested tenant
+      # Create tags in the SAME channel at the same SHA for each requested tenant
       - name: Create/verify target tags
         id: tags
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
           script: |
-            const to    = process.env.TO;
-            const ver   = process.env.VER;
-            const sha   = '${{ steps.source.outputs.sha }}';
+            const ch     = process.env.CH;
+            const ver    = process.env.VER;
+            const sha    = '${{ steps.source.outputs.sha }}';
             const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
-            const owner = context.repo.owner;
-            const repo  = context.repo.repo;
+            const owner  = context.repo.owner;
+            const repo   = context.repo.repo;
 
             let any = false;
             for (const t of tenants) {
-              const tag = `release/${to}/${t}/${ver}`;
+              const tag = `release/${ch}/${t}/${ver}`;
               try {
                 const ref = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
                 core.info(`Tag exists: ${tag} -> ${ref.data?.object?.sha}`);
@@ -146,20 +159,18 @@ jobs:
         if: steps.tags.outputs.any != 'true'
         run: echo "No target tags present — skipping GitHub Release."
 
-      # Create or update the canonical GitHub Release for the target channel/version
+      # Ensure a single canonical release for this channel/version exists, then upsert tenant sections
       - name: Ensure GitHub Release (canonical)
         if: steps.tags.outputs.any == 'true'
         id: release
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
           script: |
-            const to    = process.env.TO;
-            const ver   = process.env.VER;
+            const ch     = process.env.CH;
+            const ver    = process.env.VER;
             const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
-
             const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
-            const tagName = `release/${to}/${canonicalTenant}/${ver}`;
+            const tagName = `release/${ch}/${canonicalTenant}/${ver}`;
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
@@ -173,31 +184,30 @@ jobs:
                 release = await github.rest.repos.createRelease({
                   owner, repo,
                   tag_name: tagName,
-                  name: `${to} ${ver}`,
+                  name: `${ch} ${ver}`,
                   generate_release_notes: true,
                   draft: false,
-                  prerelease: to !== 'production'
+                  prerelease: ch !== 'production'
                 });
               } else { throw e; }
             }
             core.setOutput('release_id', (release.data ? release.data.id : release.id));
             core.setOutput('release_tag', tagName)
 
-      # OPTIONAL: append per-tenant delta to release notes
-      - name: Append per-tenant delta to release notes
+      - name: Upsert per-tenant delta in release notes
         if: steps.tags.outputs.any == 'true'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
           script: |
-            const to      = process.env.TO;
+            const ch      = process.env.CH;
             const ver     = process.env.VER;
             const owner   = context.repo.owner;
             const repo    = context.repo.repo;
             const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
 
             const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
-            const tagName = `release/${to}/${canonicalTenant}/${ver}`;
+            const tagName = `release/${ch}/${canonicalTenant}/${ver}`;
+
             const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
             let body = rel.data.body || '';
 
@@ -205,26 +215,41 @@ jobs:
             const semverLess=(a,b)=>semverCmp(a,b)<0;
 
             async function prevTagForTenant(t){
-              const prefix = `tags/release/${to}/${t}/`;
+              const prefix = `tags/release/${ch}/${t}/`;
               const { data: refs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: prefix });
               const versions = refs.map(r=>r.ref.split('/').pop()).filter(v=>v && v!==ver).sort(semverCmp);
               const prev = versions.filter(v=>semverLess(v,ver)).pop();
-              return prev ? `release/${to}/${t}/${prev}` : null;
+              return prev ? `release/${ch}/${t}/${prev}` : null;
+            }
+
+            function upsertSection(body, key, content) {
+              const start = `<!-- BEGIN:${key} -->`;
+              const end   = `<!-- END:${key} -->`;
+              const block = `${start}\n${content}\n${end}`;
+              const re = new RegExp(`${start}[\\s\\S]*?${end}`,'m');
+              if (re.test(body)) return body.replace(re, block);
+              return `${body.trim()}\n\n${block}\n`;
             }
 
             for (const t of tenants) {
               const prevTag = await prevTagForTenant(t);
-              const newTag  = `release/${to}/${t}/${ver}`;
+              const newTag  = `release/${ch}/${t}/${ver}`;
+
+              let section;
               if (!prevTag) {
-                body += `\n\n### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${to}/${t}/\`._`;
-                continue;
+                section = `### ${t.toUpperCase()} changes\n_No previous tag found in \\`release/${ch}/${t}/\\`._`;
+              } else {
+                const cmp = await github.rest.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${prevTag}...${newTag}` });
+                const lines = (cmp.data.commits||[]).map(c=>{
+                  const title=(c.commit?.message||'').split('\n')[0];
+                  const sha=(c.sha||'').slice(0,7);
+                  return `- ${title} (${sha})`;
+                });
+                section = `### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${ver}**_\n` + (lines.length?lines.join('\n'):'_No changes_');
               }
-              const cmp = await github.rest.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${prevTag}...${newTag}` });
-              const lines = (cmp.data.commits||[]).map(c=>{
-                const title=(c.commit?.message||'').split('\n')[0];
-                const sha=(c.sha||'').slice(0,7);
-                return `- ${title} (${sha})`;
-              });
-              body += `\n\n### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${ver}**_\n` + (lines.length?lines.join('\n'):'_No changes_');
+
+              const key = `tenant:${ch}:${t}:${ver}`;
+              body = upsertSection(body, key, section);
             }
+
             await github.rest.repos.updateRelease({ owner, repo, release_id: rel.data.id, body })
