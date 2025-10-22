@@ -226,7 +226,8 @@ jobs:
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
-            const canonicalTenant = tenants.includes('default') ? 'default' : (tenants[0] || 'default');
+            // Always use 'default' for the canonical release, same as the create step
+            const canonicalTenant = 'default';
             const tagName = `release/${channel}/${canonicalTenant}/${next}`;
             const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tagName });
             let body = rel.data.body || '';
@@ -249,9 +250,18 @@ jobs:
               const versions = refs
                 .map(r => r.ref.split('/').slice(-1)[0])
                 .filter(v => v && v !== next)
-                .sort((a,b) => semverCmp(a,b));
+                .sort(semverCmp);
               const prev = versions.filter(v => semverLess(v, next)).pop();
               return prev ? `release/${channel}/${t}/${prev}` : null;
+            }
+
+            // (Optional) helper to upsert a stable section per tenant to avoid duplicates
+            function upsertSection(body, key, content) {
+              const start = `<!-- BEGIN:${key} -->`;
+              const end   = `<!-- END:${key} -->`;
+              const block = `${start}\n${content}\n${end}`;
+              const re = new RegExp(`${start}[\\s\\S]*?${end}`, 'm');
+              return re.test(body) ? body.replace(re, block) : `${body.trim()}\n\n${block}\n`;
             }
 
             for (const t of tenants) {
@@ -259,7 +269,8 @@ jobs:
               const newTag  = `release/${channel}/${t}/${next}`;
 
               if (!prevTag) {
-                body += `\n\n### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${channel}/${t}/\`._`;
+                const content = `### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${channel}/${t}/\`._`;
+                body = upsertSection(body, `tenant:${channel}:${t}:${next}`, content);
                 continue;
               }
 
@@ -267,17 +278,20 @@ jobs:
                 owner, repo, basehead: `${prevTag}...${newTag}`
               });
 
+              const compareUrl = compare.data.html_url || `https://github.com/${owner}/${repo}/compare/${prevTag}...${newTag}`;
               const lines = (compare.data.commits || []).map(c => {
                 const title = (c.commit?.message || '').split('\n')[0];
                 const sha = (c.sha || '').slice(0,7);
                 return `- ${title} (${sha})`;
               });
 
-              body += `\n\n### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${next}**_\n` + (lines.length ? lines.join('\n') : '_No changes_');
+              const content = `### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${next}**_\n[Full changelog for ${t}](${compareUrl})\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
+              body = upsertSection(body, `tenant:${channel}:${t}:${next}`, content);
             }
 
             await github.rest.repos.updateRelease({
               owner, repo,
               release_id: rel.data.id,
               body
-            })
+            });
+
