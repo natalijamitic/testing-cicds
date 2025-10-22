@@ -46,9 +46,8 @@ jobs:
       - name: Fetch all refs
         run: git fetch --all --tags --force --quiet
 
-      # --- OPTIONAL GUARD (enable if you want an allowlist) ---
       # Create a file .github/promotion-allowlist.json with: { "users": ["octocat","alice"] }
-      - name: (Optional) Guard: allowlisted users only
+      - name: Guard allowlisted users only
         if: ${{ hashFiles('.github/promotion-allowlist.json') != '' }}
         uses: actions/github-script@v7
         with:
