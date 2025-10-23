@@ -54,6 +54,9 @@ runs:
           const pr = context.payload.pull_request;
           if (!pr) return fail('No pull_request found in event payload.');
 
+          const baseRef = (pr.base?.ref || '').toLowerCase(); // 'development' | 'staging' | 'production'
+          core.info(`Base ref: ${baseRef}`);
+
           // ----------------------------
           // Load allowed tenants from repo
           // ----------------------------
@@ -146,12 +149,21 @@ runs:
 
           const tenants = [...tenantSet].sort();
 
+          // ----------------------------
+          // Environment-specific policy
+          // ----------------------------
+          // Disallow CSU (directly or via 'both') when targeting the 'staging' branch
+          if (baseRef === 'staging' && tenants.includes('csu')) {
+            return fail(`Label guard: 'tenant:csu' (or 'tenant:both') is not allowed on PRs targeting 'staging'.`);
+          }
+
           // Defensive sanity check (should never trigger)
           const stray = tenants.filter(t => !allowed.includes(t));
           if (stray.length) {
             return fail(`Validator error: derived invalid tenant(s): ${stray.join(', ')}`);
           }
 
+          // Success
           core.info(`bump=${bump}, tenants=[${tenants.join(', ')}]`);
           core.setOutput('skip','false');
           core.setOutput('bump', bump);
