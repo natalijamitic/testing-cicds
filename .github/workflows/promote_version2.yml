@@ -157,87 +157,61 @@ jobs:
       # Ensure a single canonical release for this channel/version exists, then upsert tenant sections
       - name: Ensure GitHub Release (canonical)
         if: steps.tags.outputs.any == 'true'
-        id: release
+        id: canon
         uses: actions/github-script@v7
         with:
           script: |
-            const ch      = process.env.CH;
-            const ver     = process.env.VER;
-            const owner   = context.repo.owner;
-            const repo    = context.repo.repo;
+            const ch    = process.env.CH;
+            const ver   = process.env.VER;
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
 
-            function semverCmp(a,b){const pa=a.split('.').map(Number),pb=b.split('.').map(Number);for(let i=0;i<3;i++){if((pa[i]||0)<(pb[i]||0))return-1;if((pa[i]||0)>(pb[i]||0))return 1}return 0}
-            const semverLess=(a,b)=>semverCmp(a,b)<0;
-
-            async function tryGetReleaseByTag(tag){
+            async function tryGetRelease(tag){
               try { return await github.rest.repos.getReleaseByTag({ owner, repo, tag }); }
               catch(e){ if (e.status===404) return null; throw e; }
             }
-            async function tagExists(tag){
-              try { await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` }); return true; }
-              catch(e){ if (e.status===404) return false; throw e; }
-            }
 
-            // Prefer existing release on default/<ver>
+            // 1) Try default/<ver>
             let canonicalTag = `release/${ch}/default/${ver}`;
-            let rel = await tryGetReleaseByTag(canonicalTag);
+            let rel = await tryGetRelease(canonicalTag);
 
-            // Else reuse any tenant's release for this channel/version
+            // 2) Else reuse any tenant's release for this version
             if (!rel) {
               const { data: refs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: `tags/release/${ch}/` });
-              const candidates = refs
-                .map(r => r.ref.replace('refs/tags/',''))
-                .filter(ref => ref.endsWith(`/${ver}`));
-              for (const t of candidates) {
-                const r = await tryGetReleaseByTag(t);
-                if (r) { canonicalTag = t; rel = r; break; }
+              const candidates = refs.map(r => r.ref.replace('refs/tags/','')).filter(ref => ref.endsWith(`/${ver}`));
+              for (const tag of candidates) {
+                const r = await tryGetRelease(tag);
+                if (r) { canonicalTag = tag; rel = r; break; }
               }
             }
 
-            // If still not found, create one. Anchor to default/<ver> if tag exists, else first requested tenant.
             if (!rel) {
-              const tenantsCsv = '${{ steps.tenants.outputs.csv }}';
-              const tenants = tenantsCsv.split(',').filter(Boolean);
-              const defaultTagExists = await tagExists(`release/${ch}/default/${ver}`);
-              canonicalTag = defaultTagExists
-                ? `release/${ch}/default/${ver}`
-                : `release/${ch}/${(tenants[0] || 'default')}/${ver}`;
-
-              // Compute previous DEFAULT tag for better "Full Changelog"
-              const { data: drefs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: `tags/release/${ch}/default/` });
-              const versions = drefs.map(r=>r.ref.split('/').pop()).filter(v=>v && v!==ver).sort(semverCmp);
-              const prev = versions.filter(v=>semverLess(v,ver)).pop();
-              const prevTagName = prev ? `release/${ch}/default/${prev}` : undefined;
-
-              let body = '';
-              try {
-                const gen = await github.rest.repos.generateReleaseNotes({
-                  owner, repo,
-                  tag_name: canonicalTag,
-                  previous_tag_name: prevTagName,
-                });
-                body = gen.data.body || '';
-              } catch (err) {
-                core.warning(`generateReleaseNotes failed: ${err.message}`);
-              }
-
-              core.info(`Creating release for ${canonicalTag}`);
-              rel = await github.rest.repos.createRelease({
-                owner, repo,
-                tag_name: canonicalTag,
-                name: `${ch} ${ver}`,
-                body,
-                draft: false,
-                prerelease: ch !== 'production'
-              });
-            } else {
-              core.info(`Reusing existing release for ${canonicalTag}`);
+              core.setFailed(`No existing GitHub Release found for ${ch} ${ver}. Create it via the normal merge workflow first.`);
+              return;
             }
 
-            core.setOutput('release_id', (rel.data ? rel.data.id : rel.id));
+            core.info(`Using existing release: ${canonicalTag}`);
             core.setOutput('release_tag', canonicalTag);
+            core.setOutput('release_id', (rel.data ? rel.data.id : rel.id));
 
-      - name: Upsert per-tenant delta in release notes (with tenant changelog link)
+      # (Nice-to-have) Warn if the canonical release tag points to a different SHA than the source
+      - name: Sanity check; canonical release SHA vs source SHA
+        if: steps.tags.outputs.any == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const sourceSha = '${{ steps.source.outputs.sha }}';
+            const tag = '${{ steps.canon.outputs.release_tag }}';
+            const ref = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+            const releaseSha = ref.data.object.sha;
+            if (releaseSha !== sourceSha) {
+              core.warning(`Canonical release tag (${tag}) points to ${releaseSha}, but source is ${sourceSha}. Proceeding to append notes anyway.`);
+            } else {
+              core.info(`Canonical release tag matches source SHA.`);
+            }
+
+            - name: Upsert per-tenant delta in release notes
         if: steps.tags.outputs.any == 'true'
         uses: actions/github-script@v7
         with:
@@ -247,7 +221,7 @@ jobs:
             const owner   = context.repo.owner;
             const repo    = context.repo.repo;
             const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
-            const canonicalTag = '${{ steps.release.outputs.release_tag }}';
+            const canonicalTag = '${{ steps.canon.outputs.release_tag }}';
 
             const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: canonicalTag });
             let body = rel.data.body || '';
@@ -289,7 +263,7 @@ jobs:
                 return `- ${title} (${sha})`;
               });
 
-              const content = `### ${t.toUpperCase()} changes\n_From **${prevTag.split('/').pop()}** to **${ver}**_: [full changelog for ${t}](${compareUrl})\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
+              const content = `### [${t.toUpperCase()} changes](${compareUrl})\n_From **${prevTag.split('/').pop()}** to **${ver}**_:\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
               body = upsertSection(body, `tenant:${ch}:${t}:${ver}`, content);
             }
 
