@@ -1,0 +1,53 @@
+name: Auto-label dev PRs
+
+on:
+  pull_request_target:   # lets the workflow label PRs from forks safely
+    types: [opened, reopened, ready_for_review]
+    branches: [development]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  auto_label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add default labels for dev PRs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const number = context.payload.pull_request.number;
+
+            // Desired defaults
+            const desired = new Set([
+              'release:patch',
+              'tenant:default',
+              'tenant:csu'
+            ]);
+
+            // Current labels on the PR
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            const current = new Set((pr.labels || []).map(l => (l.name || '').toLowerCase()));
+
+            // If any release:* already present, don't set release:patch
+            const hasAnyRelease = [...current].some(l => l.startsWith('release:'));
+            if (hasAnyRelease) desired.delete('release:patch');
+
+            // If any tenant:* already present, don't add defaults
+            const hasAnyTenant = [...current].some(l => l.startsWith('tenant:'));
+            if (hasAnyTenant) {
+              desired.delete('tenant:default');
+              desired.delete('tenant:csu');
+            }
+
+            const toAdd = [...desired].filter(l => !current.has(l));
+            if (toAdd.length === 0) {
+              core.info('No labels to add.');
+              return;
+            }
+
+            core.info(`Adding labels: ${toAdd.join(', ')}`);
+            await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: toAdd });
