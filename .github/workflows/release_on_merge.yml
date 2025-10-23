@@ -293,4 +293,84 @@ jobs:
               release_id: rel.data.id,
               body
             });
+      
+      # Create & upload manifest.json (replace if exists)
+      - name: Create & upload manifest.json
+        if: steps.tags.outputs.any == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const owner   = context.repo.owner;
+            const repo    = context.repo.repo;
+
+            const channel = process.env.CHANNEL;
+            const version = '${{ steps.semver.outputs.next }}';
+            const mergeSha = context.payload.pull_request.merge_commit_sha;
+            const tenants = '${{ steps.labels.outputs.tenants }}'.split(',').filter(Boolean).sort();
+
+            const canonicalTag = '${{ steps.release.outputs.release_tag }}';
+
+            function semverCmp(a,b){const pa=a.split('.').map(Number),pb=b.split('.').map(Number);for(let i=0;i<3;i++){if((pa[i]||0)<(pb[i]||0))return-1;if((pa[i]||0)>(pb[i]||0))return 1}return 0}
+            const semverLess=(a,b)=>semverCmp(a,b)<0;
+
+            async function prevTagForTenant(t){
+              const prefix = `tags/release/${channel}/${t}/`;
+              const { data: refs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: prefix });
+              const versions = refs.map(r=>r.ref.split('/').pop()).filter(v=>v && v!==version).sort(semverCmp);
+              const prev = versions.filter(v=>semverLess(v,version)).pop();
+              return prev ? `release/${channel}/${t}/${prev}` : null;
+            }
+
+            // Build sections for manifest: per-tenant tag + previous + compare link
+            const tenantsObj = {};
+            const linksObj   = {};
+            for (const t of tenants) {
+              const newTag  = `release/${channel}/${t}/${version}`;
+              const prevTag = await prevTagForTenant(t);
+              tenantsObj[t] = { tag: newTag, previous: prevTag };
+              linksObj[t]   = prevTag
+                ? `https://github.com/${owner}/${repo}/compare/${prevTag}...${newTag}`
+                : null;
+            }
+
+            const manifest = {
+              channel,
+              version,
+              sha: mergeSha,
+              release_tag: canonicalTag,
+              tenants: tenantsObj,
+              links: linksObj,
+              created_at: new Date().toISOString(),
+              created_by: context.actor
+              // Optionally add your artifact metadata here later (image digests, SBOM, etc.)
+              // build: { image: "ghcr.io/…@sha256:…", sbom: "…" }
+            };
+
+            // Write to workspace
+            const outDir = path.join(process.env.GITHUB_WORKSPACE, '.out');
+            fs.mkdirSync(outDir, { recursive: true });
+            const file = path.join(outDir, 'manifest.json');
+            fs.writeFileSync(file, JSON.stringify(manifest, null, 2), 'utf8');
+            core.info(`Wrote ${file}`);
+
+            // Upload to the canonical release (replace if exists)
+            const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: canonicalTag });
+            const release_id = rel.data.id;
+
+            const assets = await github.rest.repos.listReleaseAssets({ owner, repo, release_id });
+            const existing = assets.data.find(a => a.name === 'manifest.json');
+            if (existing) {
+              await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: existing.id });
+              core.info('Deleted existing manifest.json asset');
+            }
+
+            const headers = { 'content-type': 'application/json', 'content-length': fs.statSync(file).size };
+            await github.rest.repos.uploadReleaseAsset({
+              owner, repo, release_id, name: 'manifest.json', headers, data: fs.createReadStream(file)
+            });
+            core.info('Uploaded manifest.json');
+
 
