@@ -158,10 +158,13 @@ jobs:
             const ch = process.env.CH, ver = process.env.VER;
             const sha = '${{ steps.source.outputs.sha }}';
             const tenants = '${{ steps.tenants.outputs.csv }}'.split(',').filter(Boolean);
-            const owner = context.repo.owner, repo = context.repo.repo;
+            const owner = context.repo.owner;
+            repo = context.repo.repo;
+
             for (const t of tenants) {
-              const tag = `release/${ch}/${t}/${ver}`;
-              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha });
+              const tag = `refs/tags/release/${ch}/${t}/${ver}`;
+              core.info(`Trying to create tag ${tag} at ${sha}`);
+              await github.rest.git.createRef({ owner, repo, ref: tag, sha });
               core.info(`Created tag ${tag} at ${sha}`);
             }
             core.setOutput('csv', tenants.join(','));
