@@ -121,7 +121,7 @@ jobs:
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "Found ${TAG} -> ${SHA}"
 
-      # Abort if ANY requested tenant already has this channel/version tag
+        # Abort if ANY requested tenant already has this channel/version tag
       - name: Abort if tenant tag already exists
         id: precheck
         uses: actions/github-script@v7
@@ -147,7 +147,7 @@ jobs:
             }
             core.setOutput('ok','true');
 
-      # Ensure requested tenant tags are created at the source SHA (atomic create)
+        # Ensure requested tenant tags are created at the source SHA (atomic create)
       - name: Create tenant tags
         if: steps.precheck.outputs.ok == 'true'
         id: create_tags
@@ -164,32 +164,43 @@ jobs:
               core.info(`Created tag ${tag} at ${sha}`);
             }
             core.setOutput('csv', tenants.join(','));
-
-      # Resolve EXISTING canonical release (no-create). Prefer default/<ver>, else any tenant/<ver>.
-      - name: Resolve canonical existing release (no-create)
-        id: canon
+    
+      # Ensure a single canonical release for this channel/version exists, then upsert tenant sections
+      - name: Ensure GitHub Release (canonical)
+        id: release
         uses: actions/github-script@v7
         with:
           script: |
-            const ch    = process.env.CH;
-            const ver   = process.env.VER;
-            const owner = context.repo.owner;
-            const repo  = context.repo.repo;
+            const ch      = process.env.CH;
+            const ver     = process.env.VER;
+            const owner   = context.repo.owner;
+            const repo    = context.repo.repo;
 
-            async function getRelease(tag){
+            function semverCmp(a,b){const pa=a.split('.').map(Number),pb=b.split('.').map(Number);for(let i=0;i<3;i++){if((pa[i]||0)<(pb[i]||0))return-1;if((pa[i]||0)>(pb[i]||0))return 1}return 0}
+            const semverLess=(a,b)=>semverCmp(a,b)<0;
+
+            async function tryGetReleaseByTag(tag){
               try { return await github.rest.repos.getReleaseByTag({ owner, repo, tag }); }
               catch(e){ if (e.status===404) return null; throw e; }
             }
+            async function tagExists(tag){
+              try { await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` }); return true; }
+              catch(e){ if (e.status===404) return false; throw e; }
+            }
 
+            // Prefer existing release on default/<ver>
             let canonicalTag = `release/${ch}/default/${ver}`;
-            let rel = await getRelease(canonicalTag);
+            let rel = await tryGetReleaseByTag(canonicalTag);
 
+            // Else reuse any tenant's release for this channel/version
             if (!rel) {
               const { data: refs } = await github.rest.git.listMatchingRefs({ owner, repo, ref: `tags/release/${ch}/` });
-              const candidates = refs.map(r => r.ref.replace('refs/tags/','')).filter(ref => ref.endsWith(`/${ver}`));
-              for (const tag of candidates) {
-                const r = await getRelease(tag);
-                if (r) { canonicalTag = tag; rel = r; break; }
+              const candidates = refs
+                .map(r => r.ref.replace('refs/tags/',''))
+                .filter(ref => ref.endsWith(`/${ver}`));
+              for (const t of candidates) {
+                const r = await tryGetReleaseByTag(t);
+                if (r) { canonicalTag = t; rel = r; break; }
               }
             }
 
@@ -198,16 +209,18 @@ jobs:
             core.setOutput('release_tag', canonicalTag);
             core.setOutput('release_id', (rel.data ? rel.data.id : rel.id));
 
-      # Upsert per-tenant delta in release notes (with tenant compare link)
-      - name: Upsert per-tenant section(s)
+      - name: Upsert per-tenant delta in release notes (with tenant changelog link)
         if: steps.precheck.outputs.ok == 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const ch    = process.env.CH, ver = process.env.VER;
-            const owner = context.repo.owner, repo = context.repo.repo;
+            const ch      = process.env.CH;
+            const ver     = process.env.VER;
+            const owner   = context.repo.owner;
+            const repo    = context.repo.repo;
             const tenants = '${{ steps.create_tags.outputs.csv }}'.split(',').filter(Boolean);
-            const canonicalTag = '${{ steps.canon.outputs.release_tag }}';
+            const canonicalTag = '${{ steps.release.outputs.release_tag }}';
+
             const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: canonicalTag });
             let body = rel.data.body || '';
 
@@ -222,37 +235,40 @@ jobs:
               return prev ? `release/${ch}/${t}/${prev}` : null;
             }
 
-            function upsertSection(b, key, content){
-              const start = `<!-- BEGIN:${key} -->`, end = `<!-- END:${key} -->`;
+            function upsertSection(body, key, content) {
+              const start = `<!-- BEGIN:${key} -->`;
+              const end   = `<!-- END:${key} -->`;
               const block = `${start}\n${content}\n${end}`;
               const re = new RegExp(`${start}[\\s\\S]*?${end}`,'m');
-              return re.test(b) ? b.replace(re, block) : `${b.trim()}\n\n${block}\n`;
+              return re.test(body) ? body.replace(re, block) : `${body.trim()}\n\n${block}\n`;
             }
 
             const sections = {};
             for (const t of tenants) {
               const prevTag = await prevTagForTenant(t);
               const newTag  = `release/${ch}/${t}/${ver}`;
-              let content;
-              if (!prevTag) {
-                content = `### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${ch}/${t}/\`._`;
-              } else {
-                const cmp = await github.rest.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${prevTag}...${newTag}` });
-                const url = cmp.data.html_url || `https://github.com/${owner}/${repo}/compare/${prevTag}...${newTag}`;
-                const lines = (cmp.data.commits||[]).map(c=>{
-                  const title=(c.commit?.message||'').split('\n')[0];
-                  const sha=(c.sha||'').slice(0,7);
-                  return `- ${title} (${sha})`;
-                });
 
-              content = `### [${t.toUpperCase()} changes](${compareUrl})\n_From **${prevTag.split('/').pop()}** to **${ver}**_:\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
+              if (!prevTag) {
+                const content = `### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${ch}/${t}/\`._`;
+                body = upsertSection(body, `tenant:${ch}:${t}:${ver}`, content);
+                continue;
+              }
+
+              const cmp = await github.rest.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${prevTag}...${newTag}` });
+              const compareUrl = cmp.data.html_url || `https://github.com/${owner}/${repo}/compare/${prevTag}...${newTag}`;
+              const lines = (cmp.data.commits||[]).map(c=>{
+                const title=(c.commit?.message||'').split('\n')[0];
+                const sha=(c.sha||'').slice(0,7);
+                return `- ${title} (${sha})`;
+              });
+
+              const content = `### [${t.toUpperCase()} changes](${compareUrl})\n_From **${prevTag.split('/').pop()}** to **${ver}**_:\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
               body = upsertSection(body, `tenant:${ch}:${t}:${ver}`, content);
-              sections[t] = { prevTag: prevTag || null, newTag };
             }
 
-            await github.rest.repos.updateRelease({ owner, repo, release_id: rel.data.id, body });
+            await github.rest.repos.updateRelease({ owner, repo, release_id: rel.data.id, body })
             core.setOutput('sections', JSON.stringify(sections));
-
+    
       # Build + upload manifest.json as release asset (replace if exists)
       - name: Create & upload manifest.json
         if: steps.precheck.outputs.ok == 'true'
