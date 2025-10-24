@@ -19,8 +19,7 @@ jobs:
             try {
               await github.rest.git.createRef({ owner, repo, ref: tag, sha });
               core.info(`✅ Created tag ${tag}`);
-              # await github.rest.git.deleteRef({ owner, repo, ref: tag.replace('refs/','') });
-              # core.info('✅ Deleted tag');
+
             } catch (e) {
               core.setFailed(`❌ Token cannot create tags: ${e.message}`);
             }
