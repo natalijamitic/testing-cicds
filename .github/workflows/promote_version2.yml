@@ -33,6 +33,9 @@ jobs:
       CH:  ${{ inputs.channel }}
       VER: ${{ inputs.version }}
       RAW_TENANTS: ${{ inputs.tenants }}
+    
+    permissions:
+        contents: write
 
     steps:
       - name: Show inputs
