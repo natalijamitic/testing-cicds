@@ -273,7 +273,7 @@ jobs:
             const ver    = process.env.VER;
             const sha    = '${{ steps.source.outputs.sha }}';
             const relTag = '${{ steps.release.outputs.release_tag }}';
-            const sections = JSON.parse('${{ steps.upsert.outputs.sections || "{}" }}');
+            const sections = JSON.parse('${{ steps.upsert.outputs.sections}}');
 
             // Create manifest object
             const manifest = {
