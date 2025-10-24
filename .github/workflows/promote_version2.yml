@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   promote:
@@ -147,6 +148,15 @@ jobs:
               return;
             }
             core.setOutput('ok','true');
+      - name: Check token identity and permissions
+        uses: actions/github-script@v7
+        with:
+            script: |
+                const info = await github.rest.users.getAuthenticated();
+                core.info(`Token user: ${info.data.login}`);
+                const { data: perms } = await github.rest.repos.get({ owner: context.repo.owner, repo: context.repo.repo });
+                core.info(`Default branch: ${perms.default_branch}`);
+                core.info(`Repository permissions: ${JSON.stringify(perms.permissions, null, 2)}`);
 
       # Ensure requested tenant tags are created at the source SHA (atomic create)
       - name: Create tenant tags
