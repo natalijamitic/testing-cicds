@@ -15,7 +15,7 @@ jobs:
           script: |
             const owner = context.repo.owner, repo = context.repo.repo;
             const sha = context.sha;
-            const tag = `refs/tags/test-${Date.now()}`;
+            const tag = `refs/tags/release/dev/default/test-${Date.now()}`;
             try {
               await github.rest.git.createRef({ owner, repo, ref: tag, sha });
               core.info(`✅ Created tag ${tag}`);
