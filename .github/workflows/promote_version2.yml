@@ -41,7 +41,8 @@ jobs:
           echo "tenants: ${{ inputs.tenants }}"
 
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Fetch all refs
         run: git fetch --all --tags --force --quiet
@@ -165,9 +166,9 @@ jobs:
             }
             core.setOutput('csv', tenants.join(','));
 
-      # Resolve EXISTING canonical release (no-create). Prefer default/<ver>, else any tenant/<ver>.
-      - name: Resolve canonical existing release (no-create)
-        id: canon
+      # Ensure a single canonical release for this channel/version exists, then upsert tenant sections
+      - name: Ensure GitHub Release (canonical)
+        id: release
         uses: actions/github-script@v7
         with:
           script: |
@@ -201,13 +202,16 @@ jobs:
       # Upsert per-tenant delta in release notes (with tenant compare link)
       - name: Upsert per-tenant section(s)
         if: steps.precheck.outputs.ok == 'true'
+        id: upsert
         uses: actions/github-script@v7
         with:
           script: |
-            const ch    = process.env.CH, ver = process.env.VER;
-            const owner = context.repo.owner, repo = context.repo.repo;
+            const ch      = process.env.CH;
+            const ver     = process.env.VER;
+            const owner   = context.repo.owner;
+            const repo    = context.repo.repo;
             const tenants = '${{ steps.create_tags.outputs.csv }}'.split(',').filter(Boolean);
-            const canonicalTag = '${{ steps.canon.outputs.release_tag }}';
+            const canonicalTag = '${{ steps.release.outputs.release_tag }}';
             const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag: canonicalTag });
             let body = rel.data.body || '';
 
@@ -233,19 +237,22 @@ jobs:
             for (const t of tenants) {
               const prevTag = await prevTagForTenant(t);
               const newTag  = `release/${ch}/${t}/${ver}`;
+
               let content;
               if (!prevTag) {
                 content = `### ${t.toUpperCase()} changes\n_No previous tag found in \`release/${ch}/${t}/\`._`;
               } else {
                 const cmp = await github.rest.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${prevTag}...${newTag}` });
-                const url = cmp.data.html_url || `https://github.com/${owner}/${repo}/compare/${prevTag}...${newTag}`;
+                const compareUrl = cmp.data.html_url || `https://github.com/${owner}/${repo}/compare/${prevTag}...${newTag}`;
                 const lines = (cmp.data.commits||[]).map(c=>{
                   const title=(c.commit?.message||'').split('\n')[0];
                   const sha=(c.sha||'').slice(0,7);
                   return `- ${title} (${sha})`;
                 });
+                content = `### [${t.toUpperCase()} changes](${compareUrl})\n_From **${prevTag.split('/').pop()}** to **${ver}**_:\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
+              }
 
-              content = `### [${t.toUpperCase()} changes](${compareUrl})\n_From **${prevTag.split('/').pop()}** to **${ver}**_:\n\n${lines.length ? lines.join('\n') : '_No changes_'}`;
+              // persist section + mapping (even when no prevTag)
               body = upsertSection(body, `tenant:${ch}:${t}:${ver}`, content);
               sections[t] = { prevTag: prevTag || null, newTag };
             }
@@ -262,11 +269,11 @@ jobs:
             const fs = require('fs'), path = require('path');
             const owner = context.repo.owner, repo = context.repo.repo;
 
-            const ch   = process.env.CH;
-            const ver  = process.env.VER;
-            const sha  = '${{ steps.source.outputs.sha }}';
-            const relTag = '${{ steps.canon.outputs.release_tag }}';
-            const sections = JSON.parse('${{ steps.Upsert_per-tenant_section_s.outputs.sections || steps.upsert_per-tenant_section_s.outputs.sections || 'null' }}' || 'null') || {};
+            const ch     = process.env.CH;
+            const ver    = process.env.VER;
+            const sha    = '${{ steps.source.outputs.sha }}';
+            const relTag = '${{ steps.release.outputs.release_tag }}';
+            const sections = JSON.parse('${{ steps.upsert.outputs.sections}}');
 
             // Create manifest object
             const manifest = {
