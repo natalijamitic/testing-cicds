@@ -17,7 +17,8 @@ on:
         type: string
         default: "csu"
 
-permissions: write-all
+permissions:
+    contents: write
 
 jobs:
   promote:
